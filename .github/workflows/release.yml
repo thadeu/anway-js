@@ -1,5 +1,6 @@
-# Publishes @anway/client on a `vX.Y.Z` tag. It needs the NPM_TOKEN repository
-# secret. A failed test stops the publish.
+# Publishes @anway/client on a `vX.Y.Z` tag, with npm trusted publishing (OIDC).
+# The trusted publisher uses the repository thadeu/anway-js and the workflow
+# release.yml. No token is necessary. A failed test stops the publish.
 name: Release
 
 on:
@@ -32,9 +33,11 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - uses: oven-sh/setup-bun@v2
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11
 
       - run: pnpm install --frozen-lockfile
 
@@ -75,5 +78,3 @@ jobs:
         if: steps.published.outputs.exists == 'false'
         working-directory: packages/client
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -36,7 +36,7 @@ SERVER_BIN=/path/to/anway pnpm test:package
 
 1. Change the version in `packages/client/package.json`.
 2. Push to `main`, and wait for green CI.
-3. Push a `vX.Y.Z` tag. `release.yml` tests and publishes with the `NPM_TOKEN` repository secret.
+3. Push a `vX.Y.Z` tag. `release.yml` tests and publishes with npm trusted publishing.
 
 A failed test stops the publish. A published version number cannot be used again.
 

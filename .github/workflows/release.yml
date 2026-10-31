@@ -1,0 +1,79 @@
+# Publishes @anway/client on a `vX.Y.Z` tag. It needs the NPM_TOKEN repository
+# secret. A failed test stops the publish.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SERVER_VERSION: v0.1.1
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./packages/client/package.json').version")"
+
+          if [ "$tag" != "$version" ]; then
+            echo "Tag '$tag' does not match package version '$version'" >&2
+            exit 1
+          fi
+
+          echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Download server
+        run: |
+          name="anway-${SERVER_VERSION}-linux-amd64"
+
+          mkdir -p "$RUNNER_TEMP/server"
+          curl -fsSL "https://github.com/thadeu/anway/releases/download/${SERVER_VERSION}/${name}.tar.gz" | tar xz -C "$RUNNER_TEMP/server"
+          echo "SERVER_BIN=$RUNNER_TEMP/server/$name/anway" >> "$GITHUB_ENV"
+
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm test:bun
+      - run: pnpm test:package
+
+      # A re-run of the same tag must not fail on an existing version.
+      - name: Check whether this version is already on npm
+        id: published
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/@anway%2fclient/${PACKAGE_VERSION}")"
+
+          echo "exists=$([ "$status" = "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm
+        if: steps.published.outputs.exists == 'false'
+        working-directory: packages/client
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

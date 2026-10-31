@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  SERVER_VERSION: v0.1.1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        bun-version: ['1.2.2', 'latest']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun-version }}
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Download server
+        run: |
+          name="anway-${SERVER_VERSION}-linux-amd64"
+
+          mkdir -p "$RUNNER_TEMP/server"
+          curl -fsSL "https://github.com/thadeu/anway/releases/download/${SERVER_VERSION}/${name}.tar.gz" | tar xz -C "$RUNNER_TEMP/server"
+          echo "SERVER_BIN=$RUNNER_TEMP/server/$name/anway" >> "$GITHUB_ENV"
+
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm test:bun
+      - run: pnpm test:package

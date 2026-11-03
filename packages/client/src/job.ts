@@ -36,7 +36,7 @@ export interface JobPayload {
   custom?: Record<string, JsonValue>;
 }
 
-function validateJson(value: unknown): void {
+export function validateJson(value: unknown): void {
   if (value === null) return;
 
   switch (typeof value) {

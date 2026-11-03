@@ -1,10 +1,10 @@
-import { createServer, type Server, type Socket } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Job, Worker, type WorkerOptions } from '../src/index';
-import { cleanup, openClient, processed, retries, startServer, waitFor } from './support/server';
+import { ScriptedServer } from './support/scripted';
+import { cleanup, openClient, processed, record, retries, startServer, waitFor } from './support/server';
 
 afterEach(cleanup);
 
@@ -36,77 +36,6 @@ async function within(promise: Promise<void>, limit = 8_000): Promise<void> {
       throw new Error('the worker did not stop');
     }),
   ]);
-}
-
-// Replies quiet to beats 2 to the last quiet beat, and then terminate.
-class ScriptedServer {
-  beats = 0;
-  quietFetches = 0;
-  private readonly server: Server;
-  private readonly sockets = new Set<Socket>();
-
-  constructor(private readonly lastQuietBeat: number) {
-    this.server = createServer(socket => this.accept(socket));
-  }
-
-  listen(): Promise<string> {
-    return new Promise(resolve => {
-      this.server.listen(0, '127.0.0.1', () => {
-        const address = this.server.address() as { port: number };
-
-        resolve(`tcp://127.0.0.1:${address.port}`);
-      });
-    });
-  }
-
-  close(): void {
-    this.sockets.forEach(socket => socket.destroy());
-    this.server.close();
-  }
-
-  private accept(socket: Socket): void {
-    let buffered = '';
-
-    this.sockets.add(socket);
-    socket.on('error', () => {});
-    socket.write('+HI {"v":2}\r\n');
-
-    socket.on('data', async chunk => {
-      buffered += chunk.toString();
-
-      let index = buffered.indexOf('\n');
-
-      while (index !== -1) {
-        const verb = buffered.slice(0, index).split(' ')[0]?.trim();
-
-        buffered = buffered.slice(index + 1);
-
-        socket.write(await this.reply(verb));
-
-        index = buffered.indexOf('\n');
-      }
-    });
-  }
-
-  private async reply(verb?: string): Promise<string> {
-    if (verb === 'FETCH') {
-      if (this.beats > 1) this.quietFetches++;
-
-      await sleep(5);
-
-      return '$-1\r\n';
-    }
-
-    if (verb !== 'BEAT') return '+OK\r\n';
-
-    this.beats++;
-
-    if (this.beats === 1) return '+OK\r\n';
-
-    const body = JSON.stringify({ state: this.beats > this.lastQuietBeat ? 'terminate' : 'quiet' });
-
-    return `$${body.length}\r\n${body}\r\n`;
-  }
 }
 
 describe('worker conformance', () => {
@@ -170,11 +99,16 @@ describe('worker conformance', () => {
   });
 
   it('W06 fails unfinished jobs at server terminate', async () => {
-    const server = await startServer();
-    const client = openClient(server.url);
+    let terminate = false;
     let started = false;
 
-    const subject = worker(server.url, { beatInterval: 20, shutdownTimeout: 50, cancelGrace: 100 });
+    const script = new ScriptedServer(() => (terminate ? 'terminate' : undefined));
+    const url = await script.listen();
+    const job = new Job('slow');
+
+    script.jobs.push(job.toJSON());
+
+    const subject = worker(url, { beatInterval: 20, shutdownTimeout: 50, cancelGrace: 100 });
 
     subject.register(
       'slow',
@@ -188,21 +122,18 @@ describe('worker conformance', () => {
 
     const { done } = start(subject);
 
-    await client.push(new Job('slow'));
-    await waitFor(() => started);
+    try {
+      await waitFor(() => started);
 
-    server.signal('SIGINT');
+      terminate = true;
 
-    await within(done);
-    await server.restart();
+      await within(done);
 
-    const fresh = openClient(server.url);
-
-    expect(await retries(fresh)).toBe(1);
-
-    await fresh.mutate('requeue', 'retries');
-
-    expect((await fresh.fetch('default'))?.failure).toMatchObject({ message: 'canceled' });
+      expect(script.acks).toEqual([]);
+      expect(script.fails).toEqual([expect.objectContaining({ jid: job.jid, message: 'canceled' })]);
+    } finally {
+      script.close();
+    }
   });
 
   it('W07 lets running jobs finish at a local stop', async () => {
@@ -233,7 +164,12 @@ describe('worker conformance', () => {
   });
 
   it('W08 stays alive after quiet and stops fetching', async () => {
-    const script = new ScriptedServer(20);
+    const script = new ScriptedServer(beat => {
+      if (beat === 1) return undefined;
+
+      return beat > 20 ? 'terminate' : 'quiet';
+    });
+
     const url = await script.listen();
     const { done } = start(worker(url, { beatInterval: 50 }));
 
@@ -312,5 +248,71 @@ describe('worker conformance', () => {
 
     expect(await retries(client)).toBe(1);
     expect(await processed(client)).toBe(0);
+  });
+});
+
+describe('topic worker conformance', () => {
+  it('T05 sends SUBSCRIBE before the first FETCH and runs the copies', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+    const client = openClient(server.url);
+    const received: Job[] = [];
+
+    const subject = worker(recorder.url).subscribe(
+      'chat.message',
+      { queue: 'realtime', jobtype: 'chat.broadcast', retry: 2 },
+      job => {
+        received.push(job);
+      }
+    );
+
+    start(subject);
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    expect(recorder.verbs.indexOf('SUBSCRIBE')).toBeGreaterThan(-1);
+    expect(recorder.verbs.indexOf('SUBSCRIBE')).toBeLessThan(recorder.verbs.indexOf('FETCH'));
+
+    expect((await client.publish('chat.message', ['hi'], { id: 'msg-1' })).jobs).toBe(1);
+
+    await waitFor(() => received.length === 1);
+    await waitFor(async () => (await processed(client)) === 1);
+
+    expect(received[0]).toMatchObject({ type: 'chat.broadcast', queue: 'realtime', args: ['hi'], retry: 2 });
+    expect(received[0]?.custom).toMatchObject({ topic: 'chat.message', event: 'msg-1' });
+  });
+
+  it('T06 runs one copy of every event in each of two workers', async () => {
+    const server = await startServer();
+    const client = openClient(server.url);
+    const events: Record<string, string[]> = { 'chat.store': [], 'chat.notify': [] };
+
+    const subscribers = [
+      { queue: 'cassandra', jobtype: 'chat.store' },
+      { queue: 'push', jobtype: 'chat.notify' },
+    ];
+
+    for (const subscriber of subscribers) {
+      const recorder = await record(server);
+
+      const subject = worker(recorder.url).subscribe('chat.message', subscriber, job => {
+        events[job.type]?.push(job.custom?.event as string);
+      });
+
+      start(subject);
+
+      await waitFor(() => recorder.verbs.includes('FETCH'));
+    }
+
+    const ids = ['msg-1', 'msg-2', 'msg-3'];
+
+    for (const id of ids) {
+      expect((await client.publish('chat.message', [id], { id })).jobs).toBe(2);
+    }
+
+    await waitFor(async () => (await processed(client)) === 6);
+
+    expect(events['chat.store']?.sort()).toEqual(ids);
+    expect(events['chat.notify']?.sort()).toEqual(ids);
   });
 });

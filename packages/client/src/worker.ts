@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type { ConnectionOptions as TlsOptions } from 'node:tls';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import { Client } from './client';
+import { Client, type Subscription } from './client';
 import { UnknownJobError } from './errors';
 import type { Job } from './job';
 
@@ -40,6 +40,9 @@ export interface WorkerOptions {
   timeout?: number;
 }
 
+/** The options of worker.subscribe: the subscription without its topic. */
+export type SubscribeOptions = Omit<Subscription, 'topic'>;
+
 export interface RunOptions {
   signal?: AbortSignal;
   /** Stop at SIGTERM and SIGINT. The default is true. */
@@ -75,6 +78,7 @@ export class Worker {
 
   private readonly handlers = new Map<string, Handler>();
   private readonly middleware: Middleware[] = [];
+  private readonly subscriptions = new Map<string, Subscription>();
 
   constructor(options: WorkerOptions = {}) {
     this.options = {
@@ -94,6 +98,28 @@ export class Worker {
     return this;
   }
 
+  /**
+   * Registers the handler for the job type, and records the subscription.
+   * The worker fetches from the queue, and run sends SUBSCRIBE before its first FETCH.
+   */
+  subscribe<Args extends unknown[] = unknown[]>(
+    topic: string,
+    options: SubscribeOptions,
+    handler: Handler<Args>
+  ): this {
+    const subscription = { ...options, topic };
+    const key = [topic, options.queue, options.jobtype].join('\0');
+
+    this.subscriptions.set(key, subscription);
+    this.register(options.jobtype, handler);
+
+    if (!this.options.queues.includes(options.queue)) {
+      this.options.queues = [...this.options.queues, options.queue];
+    }
+
+    return this;
+  }
+
   /** The first middleware added is the outermost. */
   use(middleware: Middleware): this {
     this.middleware.push(middleware);
@@ -108,7 +134,7 @@ export class Worker {
    * jobs that still run. A late result from these handlers is ignored.
    */
   async run(options: RunOptions = {}): Promise<void> {
-    const run = new WorkerRun(this.options, this.handlers, this.middleware);
+    const run = new WorkerRun(this.options, this.handlers, this.middleware, [...this.subscriptions.values()]);
 
     await run.start(options);
   }
@@ -125,7 +151,8 @@ class WorkerRun {
   constructor(
     private readonly options: Worker['options'],
     private readonly handlers: Map<string, Handler>,
-    private readonly middleware: Middleware[]
+    private readonly middleware: Middleware[],
+    private readonly subscriptions: Subscription[]
   ) {
     this.client = new Client({
       url: options.url,
@@ -142,6 +169,10 @@ class WorkerRun {
 
     try {
       await this.client.beat();
+
+      for (const subscription of this.subscriptions) {
+        await this.client.subscribe(subscription);
+      }
 
       if (handleSignals) {
         process.once('SIGTERM', stop);

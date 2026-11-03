@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { connect, createServer } from 'node:net';
+import { connect, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -95,8 +95,68 @@ export class TestServer {
   }
 }
 
+// A TCP proxy to a server. It records the verb of each command that a client sends.
+export class Recorder {
+  readonly verbs: string[] = [];
+  private readonly sockets = new Set<Socket>();
+  private readonly server: Server;
+  private port = 0;
+
+  constructor(private readonly target: TestServer) {
+    this.server = createServer(socket => this.accept(socket));
+  }
+
+  get url(): string {
+    return `tcp://127.0.0.1:${this.port}`;
+  }
+
+  listen(): Promise<this> {
+    return new Promise(resolve => {
+      this.server.listen(0, '127.0.0.1', () => {
+        this.port = (this.server.address() as { port: number }).port;
+
+        resolve(this);
+      });
+    });
+  }
+
+  close(): void {
+    this.sockets.forEach(socket => socket.destroy());
+    this.server.close();
+  }
+
+  private accept(client: Socket): void {
+    const upstream = connect({ host: '127.0.0.1', port: this.target.port });
+    let buffered = '';
+
+    for (const socket of [client, upstream]) {
+      this.sockets.add(socket);
+      socket.on('error', () => {});
+      socket.on('close', () => {
+        client.destroy();
+        upstream.destroy();
+      });
+    }
+
+    upstream.pipe(client);
+
+    client.on('data', chunk => {
+      buffered += chunk.toString();
+
+      const lines = buffered.split('\n');
+
+      buffered = lines.pop() ?? '';
+
+      for (const line of lines) this.verbs.push(line.split(' ')[0]?.trim() ?? '');
+
+      upstream.write(chunk);
+    });
+  }
+}
+
 const servers: TestServer[] = [];
 const clients: Client[] = [];
+const recorders: Recorder[] = [];
 
 export async function startServer(env: Record<string, string> = {}): Promise<TestServer> {
   const server = await new TestServer(env).start();
@@ -104,6 +164,14 @@ export async function startServer(env: Record<string, string> = {}): Promise<Tes
   servers.push(server);
 
   return server;
+}
+
+export async function record(target: TestServer): Promise<Recorder> {
+  const recorder = await new Recorder(target).listen();
+
+  recorders.push(recorder);
+
+  return recorder;
 }
 
 export function openClient(url: string, options: ClientOptions = {}): Client {
@@ -116,6 +184,7 @@ export function openClient(url: string, options: ClientOptions = {}): Client {
 
 export async function cleanup(): Promise<void> {
   clients.splice(0).forEach(client => client.close());
+  recorders.splice(0).forEach(recorder => recorder.close());
 
   await Promise.all(servers.splice(0).map(server => server.cleanup()));
 }
@@ -132,6 +201,10 @@ export async function waitFor(check: () => boolean | Promise<boolean>, limit = 5
 
 export async function retries(client: Client): Promise<number> {
   return (await client.info()).faktory.tasks.Retries?.size ?? 0;
+}
+
+export async function dead(client: Client): Promise<number> {
+  return (await client.info()).faktory.tasks.Dead?.size ?? 0;
 }
 
 export async function processed(client: Client): Promise<number> {

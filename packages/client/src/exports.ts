@@ -8,6 +8,9 @@ export type {
   Info,
   MutateCommand,
   MutateTarget,
+  Published,
+  PublishOptions,
+  Subscription,
   Track,
   TrackUpdate,
 } from './client';
@@ -20,4 +23,4 @@ export type { Failure, JobOptions, JobPayload, JsonValue } from './job';
 
 export { Worker } from './worker';
 
-export type { Handler, JobContext, Logger, Middleware, RunOptions, WorkerOptions } from './worker';
+export type { Handler, JobContext, Logger, Middleware, RunOptions, SubscribeOptions, WorkerOptions } from './worker';

@@ -79,6 +79,51 @@ The worker stops at SIGTERM, SIGINT, the server `terminate` command, or the `sig
 
 Handlers must respect `signal`. JavaScript cannot stop a promise, so a handler that ignores it continues to run until the process ends. Set the container stop timeout above 30 seconds.
 
+## Topics
+
+A topic sends one event to many queues. `publish` makes one job for each subscription of the topic, in one transaction. Each copy is a normal job in the queue of its subscriber, with its own retries and dead set.
+
+In this example, one `chat.message` event goes to three queues: `realtime`, `cassandra`, and `push`.
+
+```ts
+import Anway from '@anway/client';
+
+const client = new Anway.Client();
+
+const published = await client.publish('chat.message', [{ room: 'general', body: 'hi' }], { id: 'msg-42' });
+
+console.log(published);
+// { event: 'msg-42', jobs: 3, duplicate: false }
+```
+
+Each app declares its subscription in its worker. `subscribe` registers the handler for the job type and adds the queue to the queues of the worker. When `run` starts, the worker sends `SUBSCRIBE` for each subscription, before its first fetch.
+
+```ts
+const worker = new Anway.Worker();
+
+worker.subscribe('chat.message', { queue: 'realtime', jobtype: 'chat.broadcast' }, async job => {
+  await broadcast(job.args[0]);
+});
+
+worker.subscribe('chat.message', { queue: 'cassandra', jobtype: 'chat.store', retry: 10 }, async job => {
+  await store(job.custom?.event, job.args[0]);
+});
+
+worker.subscribe('chat.message', { queue: 'push', jobtype: 'chat.notify', reserveFor: 60 }, async job => {
+  await notify(job.args[0]);
+});
+
+await worker.run();
+```
+
+- The server saves subscriptions on disk. A copy goes to the queue also when the subscriber app is down.
+- `publish(topic, args, { id, uniqueFor, custom })`: with an `id`, a second publish of the same topic and id within `uniqueFor` seconds makes no job, and the reply has `duplicate: true`. The default of `uniqueFor` is one day. `0` turns the check off.
+- The server adds `topic` and `event` to `custom` of each copy. Use `custom.event` as the key to make a handler idempotent.
+- An event with no subscription goes to the dead set as one job, and the reply has `jobs: 0`.
+- `client.subscribe({ topic, queue, jobtype, retry, reserveFor })` is idempotent. `client.unsubscribe({ topic, queue, jobtype })` does not fail for a missing subscription.
+
+See [topics](https://github.com/thadeu/anway/blob/main/docs/dev/topics.md) for the server rules.
+
 ## Client
 
 `Anway.Client` has the operations of [anway-go](https://github.com/thadeu/anway-go), in camelCase.
@@ -86,6 +131,7 @@ Handlers must respect `signal`. JavaScript cannot stop a promise, so a handler t
 | Group | Operations |
 |---|---|
 | Jobs | `push`, `fetch`, `ack`, `fail`, `beat` |
+| Topics | `publish`, `subscribe`, `unsubscribe` |
 | Queues | `pauseQueues`, `resumeQueues`, `removeQueues`, `queueSizes`, `info` |
 | Admin | `mutate` |
 | Batches | `batchNew`, `batchOpen`, `batchCommit`, `batchStatus` |

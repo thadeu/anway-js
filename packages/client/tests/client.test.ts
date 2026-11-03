@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import Anway, { ClosedError, ConnectionError, Job, NotUniqueError, ServerError } from '../src/index';
-import { cleanup, openClient, retries, startServer } from './support/server';
+import { cleanup, dead, openClient, retries, startServer } from './support/server';
 
 afterEach(cleanup);
 
@@ -205,6 +205,84 @@ describe('client conformance', () => {
     client.close();
 
     await expect(client.push(new Job('x'))).rejects.toBeInstanceOf(ClosedError);
+  });
+});
+
+describe('topic conformance', () => {
+  const chat = [
+    { queue: 'realtime', jobtype: 'chat.broadcast' },
+    { queue: 'cassandra', jobtype: 'chat.store' },
+    { queue: 'push', jobtype: 'chat.notify' },
+  ];
+
+  it('T01 publishes one copy to each subscriber queue', async () => {
+    const client = openClient((await startServer()).url);
+    const args = [{ room: 'general', body: 'hi' }];
+
+    for (const subscriber of chat) {
+      await client.subscribe({ topic: 'chat.message', ...subscriber, retry: 3, reserveFor: 60 });
+    }
+
+    const published = await client.publish('chat.message', args, { id: 'msg-42', custom: { source: 'test' } });
+
+    expect(published).toEqual({ event: 'msg-42', jobs: 3, duplicate: false });
+
+    for (const { queue, jobtype } of chat) {
+      const job = await client.fetch(queue);
+
+      expect(job).toMatchObject({ type: jobtype, queue, args, retry: 3, reserveFor: 60 });
+      expect(job?.custom).toMatchObject({ topic: 'chat.message', event: 'msg-42', source: 'test' });
+    }
+  });
+
+  it('T02 keeps one subscription and unsubscribes twice without an error', async () => {
+    const client = openClient((await startServer()).url);
+    const subscription = { topic: 'chat.message', queue: 'realtime', jobtype: 'chat.broadcast' };
+
+    await client.subscribe(subscription);
+    await client.subscribe({ ...subscription, retry: 5 });
+
+    expect((await client.publish('chat.message')).jobs).toBe(1);
+    expect((await client.fetch('realtime'))?.retry).toBe(5);
+
+    await client.unsubscribe(subscription);
+    await client.unsubscribe(subscription);
+
+    expect((await client.publish('chat.message')).jobs).toBe(0);
+  });
+
+  it('T03 returns duplicate for a second publish of the same event id', async () => {
+    const client = openClient((await startServer()).url);
+
+    await client.subscribe({ topic: 'chat.message', queue: 'realtime', jobtype: 'chat.broadcast' });
+
+    expect(await client.publish('chat.message', [1], { id: 'msg-1' })).toMatchObject({ duplicate: false, jobs: 1 });
+    expect(await client.publish('chat.message', [1], { id: 'msg-1' })).toMatchObject({ duplicate: true, jobs: 0 });
+    expect(await client.queueSizes()).toEqual({ realtime: 1 });
+
+    for (let i = 0; i < 2; i++) {
+      expect(await client.publish('chat.message', [2], { id: 'msg-2', uniqueFor: 0 })).toMatchObject({
+        duplicate: false,
+        jobs: 1,
+      });
+    }
+
+    expect(await client.queueSizes()).toEqual({ realtime: 3 });
+  });
+
+  it('T04 sends an event with no subscription to the dead set', async () => {
+    const client = openClient((await startServer()).url);
+    const published = await client.publish('chat.message', [{ body: 'hi' }]);
+
+    expect(published).toMatchObject({ jobs: 0, duplicate: false });
+    expect(published.event).toBeTypeOf('string');
+    expect(await dead(client)).toBe(1);
+  });
+
+  it('rejects publish args that are not JSON types', async () => {
+    const client = openClient((await startServer()).url);
+
+    await expect(client.publish('chat.message', [new Date()])).rejects.toBeInstanceOf(TypeError);
   });
 });
 

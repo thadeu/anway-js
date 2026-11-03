@@ -1,7 +1,7 @@
 import type { ConnectionOptions as TlsOptions } from 'node:tls';
 
 import { Connection, type Endpoint } from './connection';
-import { Job, type JobPayload } from './job';
+import { Job, validateJson, type JobPayload, type JsonValue } from './job';
 import { Pool } from './pool';
 
 const DEFAULT_URL = 'tcp://127.0.0.1:7419';
@@ -63,6 +63,35 @@ export interface TrackUpdate {
   percent?: number;
   desc?: string;
   reserveUntil?: Date;
+}
+
+/** The reply to publish. */
+export interface Published {
+  /** The event id: the given id, or an id that the server made. */
+  event: string;
+  /** The number of copies, one for each subscription. */
+  jobs: number;
+  /** True when the same event id was published within uniqueFor. */
+  duplicate: boolean;
+}
+
+export interface PublishOptions {
+  /** The event id. A second publish of the same topic and id within uniqueFor does nothing. */
+  id?: string;
+  /** Seconds. The server default is 86,400 when id is set. 0 turns the check off. */
+  uniqueFor?: number;
+  /** Goes to each copy. The server adds topic and event. */
+  custom?: Record<string, JsonValue>;
+}
+
+/** Sends the events of a topic to a queue, as jobs of one job type. */
+export interface Subscription {
+  topic: string;
+  queue: string;
+  jobtype: string;
+  retry?: number;
+  /** Seconds. */
+  reserveFor?: number;
 }
 
 // Server data. The faktory hash has this name in the public wire format.
@@ -206,6 +235,41 @@ export class Client {
     };
 
     await this.call('TRACK', `SET ${JSON.stringify(body)}`);
+  }
+
+  /** Makes one job for each subscription of the topic. With no subscription, the event goes to the dead set. */
+  async publish(topic: string, args: unknown[] = [], options: PublishOptions = {}): Promise<Published> {
+    validateJson(args);
+
+    const event = {
+      topic,
+      args,
+      id: options.id,
+      unique_for: options.uniqueFor,
+      custom: options.custom,
+    };
+
+    return JSON.parse((await this.call('PUBLISH', event)) as string);
+  }
+
+  /** Idempotent. A second call sets the new retry and reserveFor. */
+  async subscribe(subscription: Subscription): Promise<void> {
+    const body = {
+      topic: subscription.topic,
+      queue: subscription.queue,
+      jobtype: subscription.jobtype,
+      retry: subscription.retry,
+      reserve_for: subscription.reserveFor,
+    };
+
+    await this.call('SUBSCRIBE', body);
+  }
+
+  /** A missing subscription is not an error. */
+  async unsubscribe(subscription: Pick<Subscription, 'topic' | 'queue' | 'jobtype'>): Promise<void> {
+    const { topic, queue, jobtype } = subscription;
+
+    await this.call('UNSUBSCRIBE', { topic, queue, jobtype });
   }
 
   private call(verb: string, argument?: unknown, wait = 0): Promise<string | null> {

@@ -22,7 +22,8 @@ export interface ClientOptions {
 
 /** Selects jobs for mutate. Blank fields match all jobs. */
 export interface Filter {
-  jobtype?: string;
+  /** The event of the jobs. It is the jobtype field on the wire. */
+  event?: string;
   jids?: string[];
   regexp?: string;
 }
@@ -84,11 +85,12 @@ export interface PublishOptions {
   custom?: Record<string, JsonValue>;
 }
 
-/** Sends the events of a topic to a queue, as jobs of one job type. */
+/** Sends the events of a topic to a queue, as jobs of one event. */
 export interface Subscription {
   topic: string;
   queue: string;
-  jobtype: string;
+  /** The event of the copies. It is the jobtype field on the wire. */
+  event: string;
   retry?: number;
   /** Seconds. */
   reserveFor?: number;
@@ -196,7 +198,9 @@ export class Client {
   }
 
   async mutate(command: MutateCommand, target: MutateTarget, filter: Filter = {}): Promise<void> {
-    await this.call('MUTATE', { cmd: command, target, filter });
+    const { event, ...rest } = filter;
+
+    await this.call('MUTATE', { cmd: command, target, filter: { ...rest, jobtype: event } });
   }
 
   async batchNew(batch: Batch): Promise<string> {
@@ -257,7 +261,7 @@ export class Client {
     const body = {
       topic: subscription.topic,
       queue: subscription.queue,
-      jobtype: subscription.jobtype,
+      jobtype: subscription.event,
       retry: subscription.retry,
       reserve_for: subscription.reserveFor,
     };
@@ -266,10 +270,10 @@ export class Client {
   }
 
   /** A missing subscription is not an error. */
-  async unsubscribe(subscription: Pick<Subscription, 'topic' | 'queue' | 'jobtype'>): Promise<void> {
-    const { topic, queue, jobtype } = subscription;
+  async unsubscribe(subscription: Pick<Subscription, 'topic' | 'queue' | 'event'>): Promise<void> {
+    const { topic, queue, event } = subscription;
 
-    await this.call('UNSUBSCRIBE', { topic, queue, jobtype });
+    await this.call('UNSUBSCRIBE', { topic, queue, jobtype: event });
   }
 
   private call(verb: string, argument?: unknown, wait = 0): Promise<string | null> {

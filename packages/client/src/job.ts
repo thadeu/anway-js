@@ -1,5 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
+import { translateOptions, type Options } from './options';
+
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface Failure {
@@ -9,16 +11,6 @@ export interface Failure {
   message?: string;
   errtype?: string;
   backtrace?: string[];
-}
-
-export interface JobOptions {
-  jid?: string;
-  queue?: string;
-  retry?: number;
-  reserveFor?: number;
-  backtrace?: number;
-  at?: Date;
-  custom?: Record<string, JsonValue>;
 }
 
 export interface JobPayload {
@@ -69,6 +61,7 @@ export function validateJson(value: unknown): void {
 /** One unit of work. Other languages read the args, so only JSON types are valid. */
 export class Job<Args extends unknown[] = unknown[]> {
   jid: string;
+  /** The event of the job. It is the jobtype field on the wire. */
   type: string;
   args: Args;
   queue?: string;
@@ -100,21 +93,23 @@ export class Job<Args extends unknown[] = unknown[]> {
     return job;
   }
 
-  constructor(type: string, args?: Args, options: JobOptions = {}) {
+  /** Takes the keys of the input contract. The topics key is for a declaration, so a push ignores it. */
+  constructor(event: string, args?: Args, options: Options = {}) {
     const values = (args ?? []) as Args;
 
     validateJson(values);
 
-    this.jid = options.jid ?? randomBytes(12).toString('hex');
-    this.type = type;
-    this.args = values;
-    this.queue = options.queue;
-    this.retry = options.retry;
-    this.reserveFor = options.reserveFor;
-    this.backtrace = options.backtrace;
-    this.custom = options.custom;
+    const { fields } = translateOptions(options);
 
-    if (options.at) this.runAt(options.at);
+    this.jid = randomBytes(12).toString('hex');
+    this.type = event;
+    this.args = values;
+    this.queue = fields.queue;
+    this.retry = fields.retry;
+    this.reserveFor = fields.reserve_for;
+    this.backtrace = fields.backtrace;
+    this.at = fields.at;
+    this.custom = fields.custom;
   }
 
   runAt(at: Date): this {

@@ -19,8 +19,10 @@ export { AnwayError, ClosedError, ConnectionError, NotUniqueError, ServerError, 
 
 export { Job } from './job';
 
-export type { Failure, JobOptions, JobPayload, JsonValue } from './job';
+export type { Failure, JobPayload, JsonValue } from './job';
+
+export type { OnDead, Options } from './options';
 
 export { Worker } from './worker';
 
-export type { Handler, JobContext, Logger, Middleware, RunOptions, SubscribeOptions, WorkerOptions } from './worker';
+export type { Handler, JobContext, Logger, Middleware, RunOptions, WorkerOptions } from './worker';

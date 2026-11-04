@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import Anway, { ClosedError, ConnectionError, Job, NotUniqueError, ServerError } from '../src/index';
-import { cleanup, dead, openClient, retries, startServer } from './support/server';
+import { cleanup, dead, openClient, record, retries, startServer } from './support/server';
 
 afterEach(cleanup);
 
@@ -100,7 +100,7 @@ describe('client conformance', () => {
 
   it('C07 rejects a second unique push with the not-unique kind', async () => {
     const client = openClient((await startServer()).url);
-    const unique = () => new Job('x', [1]).setCustom('unique_for', 60);
+    const unique = () => new Job('x', [1], { uniqueFor: 60 });
 
     await client.push(unique());
 
@@ -139,7 +139,7 @@ describe('client conformance', () => {
       await client.fail(jid, 'Boom', 'failed');
     }
 
-    await client.mutate('requeue', 'retries', { jobtype: 'a' });
+    await client.mutate('requeue', 'retries', { event: 'a' });
 
     expect(await retries(client)).toBe(1);
     expect((await client.fetch('default'))?.type).toBe('a');
@@ -165,7 +165,7 @@ describe('client conformance', () => {
 
   it('C12 sets and gets job progress', async () => {
     const client = openClient((await startServer()).url);
-    const jid = await client.push(new Job('x').setCustom('track', 1));
+    const jid = await client.push(new Job('x', [], { track: true }));
 
     await client.trackSet({ jid, percent: 40, desc: 'step' });
 
@@ -210,9 +210,9 @@ describe('client conformance', () => {
 
 describe('topic conformance', () => {
   const chat = [
-    { queue: 'realtime', jobtype: 'chat.broadcast' },
-    { queue: 'cassandra', jobtype: 'chat.store' },
-    { queue: 'push', jobtype: 'chat.notify' },
+    { queue: 'realtime', event: 'chat.broadcast' },
+    { queue: 'cassandra', event: 'chat.store' },
+    { queue: 'push', event: 'chat.notify' },
   ];
 
   it('T01 publishes one copy to each subscriber queue', async () => {
@@ -227,17 +227,17 @@ describe('topic conformance', () => {
 
     expect(published).toEqual({ event: 'msg-42', jobs: 3, duplicate: false });
 
-    for (const { queue, jobtype } of chat) {
+    for (const { queue, event } of chat) {
       const job = await client.fetch(queue);
 
-      expect(job).toMatchObject({ type: jobtype, queue, args, retry: 3, reserveFor: 60 });
+      expect(job).toMatchObject({ type: event, queue, args, retry: 3, reserveFor: 60 });
       expect(job?.custom).toMatchObject({ topic: 'chat.message', event: 'msg-42', source: 'test' });
     }
   });
 
   it('T02 keeps one subscription and unsubscribes twice without an error', async () => {
     const client = openClient((await startServer()).url);
-    const subscription = { topic: 'chat.message', queue: 'realtime', jobtype: 'chat.broadcast' };
+    const subscription = { topic: 'chat.message', queue: 'realtime', event: 'chat.broadcast' };
 
     await client.subscribe(subscription);
     await client.subscribe({ ...subscription, retry: 5 });
@@ -254,7 +254,7 @@ describe('topic conformance', () => {
   it('T03 returns duplicate for a second publish of the same event id', async () => {
     const client = openClient((await startServer()).url);
 
-    await client.subscribe({ topic: 'chat.message', queue: 'realtime', jobtype: 'chat.broadcast' });
+    await client.subscribe({ topic: 'chat.message', queue: 'realtime', event: 'chat.broadcast' });
 
     expect(await client.publish('chat.message', [1], { id: 'msg-1' })).toMatchObject({ duplicate: false, jobs: 1 });
     expect(await client.publish('chat.message', [1], { id: 'msg-1' })).toMatchObject({ duplicate: true, jobs: 0 });
@@ -283,6 +283,60 @@ describe('topic conformance', () => {
     const client = openClient((await startServer()).url);
 
     await expect(client.publish('chat.message', [new Date()])).rejects.toBeInstanceOf(TypeError);
+  });
+});
+
+describe('input contract conformance', () => {
+  it('I01 sends the contract keys of a push in custom, and the event as jobtype', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+    const client = openClient(recorder.url);
+    const at = new Date(Date.now() + 3_600_000);
+    const expiresAt = new Date(Date.now() + 7_200_000);
+
+    const job = new Job('mail.send', ['a@b.com'], {
+      queue: 'mail',
+      retry: 3,
+      reserveFor: 60,
+      backtrace: 10,
+      at,
+      uniqueFor: 600,
+      uniqueUntil: 'start',
+      expiresIn: 300,
+      expiresAt,
+      track: true,
+      onDead: { event: 'mail.bounced', queue: 'rails' },
+      custom: { unique_for: 1, track: 0, source: 'test' },
+      topics: ['ignored.by.push'],
+    });
+
+    await client.push(job);
+
+    expect(recorder.bodies('PUSH')).toEqual([
+      {
+        jid: job.jid,
+        jobtype: 'mail.send',
+        args: ['a@b.com'],
+        queue: 'mail',
+        retry: 3,
+        reserve_for: 60,
+        backtrace: 10,
+        at: at.toISOString(),
+        custom: {
+          source: 'test',
+          unique_for: 600,
+          unique_until: 'start',
+          expires_in: 300,
+          expires_at: expiresAt.toISOString(),
+          track: 1,
+          on_dead: { jobtype: 'mail.bounced', queue: 'rails' },
+        },
+      },
+    ]);
+
+    await client.push(new Job('mail.send', [], { onDead: { event: 'mail.bounced' } }));
+
+    expect(recorder.bodies('PUSH')[1]?.custom).toEqual({ on_dead: { jobtype: 'mail.bounced' } });
   });
 });
 

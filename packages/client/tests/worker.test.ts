@@ -2,7 +2,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { Job, Worker, type WorkerOptions } from '../src/index';
+import { Job, Worker, type Options, type WorkerOptions } from '../src/index';
+import { translateOptions } from '../src/options';
 import { ScriptedServer } from './support/scripted';
 import { cleanup, openClient, processed, record, retries, startServer, waitFor } from './support/server';
 
@@ -42,7 +43,7 @@ describe('worker conformance', () => {
   it('W01 runs a job and acks it', async () => {
     const server = await startServer();
     const client = openClient(server.url);
-    const subject = worker(server.url).register('x', () => {});
+    const subject = worker(server.url).on('x', () => {});
 
     start(subject);
 
@@ -55,13 +56,13 @@ describe('worker conformance', () => {
     const client = openClient(server.url);
 
     const subject = worker(server.url)
-      .register('rejected', async () => {
+      .on('rejected', async () => {
         throw new Error('failed');
       })
-      .register('thrown', () => {
+      .on('thrown', () => {
         throw new TypeError('boom');
       })
-      .register('ok', () => {});
+      .on('ok', () => {});
 
     start(subject);
 
@@ -86,7 +87,7 @@ describe('worker conformance', () => {
 
         return next();
       })
-      .register('x', () => {
+      .on('x', () => {
         order.push('job');
       });
 
@@ -110,7 +111,7 @@ describe('worker conformance', () => {
 
     const subject = worker(url, { beatInterval: 20, shutdownTimeout: 50, cancelGrace: 100 });
 
-    subject.register(
+    subject.on(
       'slow',
       (_job, { signal }) =>
         new Promise((_resolve, reject) => {
@@ -142,7 +143,7 @@ describe('worker conformance', () => {
     let started = false;
     let finished = false;
 
-    const subject = worker(server.url).register('slow', async () => {
+    const subject = worker(server.url).on('slow', async () => {
       started = true;
 
       await sleep(300);
@@ -190,7 +191,7 @@ describe('worker conformance', () => {
 
     const subject = worker(server.url, { shutdownTimeout: 50 });
 
-    subject.register(
+    subject.on(
       'slow',
       (_job, { signal }) =>
         new Promise((_resolve, reject) => {
@@ -224,7 +225,7 @@ describe('worker conformance', () => {
 
     const subject = worker(server.url, { shutdownTimeout: 50, cancelGrace: 50 });
 
-    subject.register(
+    subject.on(
       'stuck',
       () =>
         new Promise<void>(resolve => {
@@ -258,12 +259,12 @@ describe('topic worker conformance', () => {
     const client = openClient(server.url);
     const received: Job[] = [];
 
-    const subject = worker(recorder.url).subscribe(
-      'chat.message',
-      { queue: 'realtime', jobtype: 'chat.broadcast', retry: 2 },
+    const subject = worker(recorder.url).on(
+      'chat.broadcast',
       job => {
         received.push(job);
-      }
+      },
+      { queue: 'realtime', retry: 2, topics: ['chat.message'] }
     );
 
     start(subject);
@@ -288,16 +289,20 @@ describe('topic worker conformance', () => {
     const events: Record<string, string[]> = { 'chat.store': [], 'chat.notify': [] };
 
     const subscribers = [
-      { queue: 'cassandra', jobtype: 'chat.store' },
-      { queue: 'push', jobtype: 'chat.notify' },
+      { queue: 'cassandra', event: 'chat.store' },
+      { queue: 'push', event: 'chat.notify' },
     ];
 
-    for (const subscriber of subscribers) {
+    for (const { queue, event } of subscribers) {
       const recorder = await record(server);
 
-      const subject = worker(recorder.url).subscribe('chat.message', subscriber, job => {
-        events[job.type]?.push(job.custom?.event as string);
-      });
+      const subject = worker(recorder.url).on(
+        event,
+        job => {
+          events[job.type]?.push(job.custom?.event as string);
+        },
+        { queue, topics: ['chat.message'] }
+      );
 
       start(subject);
 
@@ -314,5 +319,102 @@ describe('topic worker conformance', () => {
 
     expect(events['chat.store']?.sort()).toEqual(ids);
     expect(events['chat.notify']?.sort()).toEqual(ids);
+  });
+});
+
+describe('input contract conformance', () => {
+  it('I02 merges two option sets in order', async () => {
+    const first: Options = {
+      queue: 'first',
+      retry: 1,
+      uniqueFor: 60,
+      topics: ['chat.message', 'chat.edit'],
+      custom: { kept: 1, shared: 'first' },
+    };
+
+    const second: Options = {
+      queue: 'second',
+      reserveFor: 120,
+      uniqueFor: 120,
+      topics: ['chat.edit', 'chat.delete'],
+      custom: { added: 2, shared: 'second' },
+    };
+
+    expect(translateOptions(first, second)).toEqual({
+      fields: {
+        queue: 'second',
+        retry: 1,
+        reserve_for: 120,
+        custom: { kept: 1, added: 2, shared: 'second', unique_for: 120 },
+      },
+      topics: ['chat.message', 'chat.edit', 'chat.delete'],
+    });
+
+    const server = await startServer();
+    const recorder = await record(server);
+
+    start(worker(recorder.url).on('chat.store', () => {}, first, second));
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    expect(recorder.bodies('SUBSCRIBE')).toEqual(
+      ['chat.message', 'chat.edit', 'chat.delete'].map(topic => ({
+        topic,
+        queue: 'second',
+        jobtype: 'chat.store',
+        retry: 1,
+        reserve_for: 120,
+      }))
+    );
+  });
+
+  it('I03 rejects a second declaration for the same event', () => {
+    const subject = worker('tcp://127.0.0.1:1').on('chat.store', () => {});
+
+    expect(() => subject.on('chat.store', () => {}, { topics: ['chat.message'] })).toThrow(
+      /handler for the event "chat.store"/
+    );
+
+    expect(() => subject.on('chat.notify', () => {})).not.toThrow();
+  });
+
+  it('I04 subscribes each topic of a declaration and runs the copies', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+    const client = openClient(server.url);
+    const received: Job[] = [];
+    const topics = ['chat.message', 'chat.edit'];
+
+    const subject = worker(recorder.url).on(
+      'chat.store',
+      job => {
+        received.push(job);
+      },
+      { queue: 'cassandra', retry: 4, reserveFor: 90, topics, at: new Date(Date.now() + 3_600_000) }
+    );
+
+    start(subject);
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    expect(recorder.bodies('SUBSCRIBE')).toEqual(
+      topics.map(topic => ({ topic, queue: 'cassandra', jobtype: 'chat.store', retry: 4, reserve_for: 90 }))
+    );
+
+    expect(recorder.verbs.lastIndexOf('SUBSCRIBE')).toBeLessThan(recorder.verbs.indexOf('FETCH'));
+
+    for (const topic of topics) {
+      expect((await client.publish(topic, [topic], { id: `${topic}-1` })).jobs).toBe(1);
+    }
+
+    await waitFor(async () => (await processed(client)) === 2);
+
+    const copies = received.map(job => job.args[0]).sort();
+
+    expect(copies).toEqual([...topics].sort());
+
+    for (const job of received) {
+      expect(job).toMatchObject({ type: 'chat.store', queue: 'cassandra', retry: 4, reserveFor: 90 });
+    }
   });
 });

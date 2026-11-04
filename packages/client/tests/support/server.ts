@@ -95,9 +95,16 @@ export class TestServer {
   }
 }
 
-// A TCP proxy to a server. It records the verb of each command that a client sends.
+export interface Command {
+  verb: string;
+  /** The text after the verb, such as the JSON of a job. */
+  body: string;
+}
+
+// A TCP proxy to a server. It records each command that a client sends.
 export class Recorder {
   readonly verbs: string[] = [];
+  readonly commands: Command[] = [];
   private readonly sockets = new Set<Socket>();
   private readonly server: Server;
   private port = 0;
@@ -125,6 +132,11 @@ export class Recorder {
     this.server.close();
   }
 
+  /** The JSON bodies of the commands with this verb, in order. */
+  bodies<T = Record<string, unknown>>(verb: string): T[] {
+    return this.commands.filter(command => command.verb === verb).map(command => JSON.parse(command.body) as T);
+  }
+
   private accept(client: Socket): void {
     const upstream = connect({ host: '127.0.0.1', port: this.target.port });
     let buffered = '';
@@ -147,7 +159,14 @@ export class Recorder {
 
       buffered = lines.pop() ?? '';
 
-      for (const line of lines) this.verbs.push(line.split(' ')[0]?.trim() ?? '');
+      for (const line of lines) {
+        const text = line.trim();
+        const space = text.indexOf(' ');
+        const verb = space === -1 ? text : text.slice(0, space);
+
+        this.verbs.push(verb);
+        this.commands.push({ verb, body: space === -1 ? '' : text.slice(space + 1) });
+      }
 
       upstream.write(chunk);
     });

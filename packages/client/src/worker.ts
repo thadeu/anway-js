@@ -5,6 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { Client, type Subscription } from './client';
 import { UnknownJobError } from './errors';
 import type { Job } from './job';
+import { translateOptions, type Options } from './options';
 
 const EMPTY_FETCH_MINIMUM = 200;
 const ERROR_PAUSE = 1_000;
@@ -39,9 +40,6 @@ export interface WorkerOptions {
   /** Milliseconds for each server call. */
   timeout?: number;
 }
-
-/** The options of worker.subscribe: the subscription without its topic. */
-export type SubscribeOptions = Omit<Subscription, 'topic'>;
 
 export interface RunOptions {
   signal?: AbortSignal;
@@ -78,7 +76,7 @@ export class Worker {
 
   private readonly handlers = new Map<string, Handler>();
   private readonly middleware: Middleware[] = [];
-  private readonly subscriptions = new Map<string, Subscription>();
+  private readonly subscriptions: Subscription[] = [];
 
   constructor(options: WorkerOptions = {}) {
     this.options = {
@@ -92,29 +90,35 @@ export class Worker {
     };
   }
 
-  register<Args extends unknown[] = unknown[]>(jobType: string, handler: Handler<Args>): this {
-    this.handlers.set(jobType, handler as Handler);
-
-    return this;
-  }
-
   /**
-   * Registers the handler for the job type, and records the subscription.
-   * The worker fetches from the queue, and run sends SUBSCRIBE before its first FETCH.
+   * Declares the handler of an event. The option sets merge in order, as the
+   * input contract tells. The worker records one subscription for each topic,
+   * with the event, queue, retry, and reserveFor of the declaration, and run
+   * sends SUBSCRIBE before its first FETCH. When the declaration has topics or
+   * a queue, the worker also fetches from that queue. Keys for a push only,
+   * such as at, uniqueFor, and custom, have no effect here.
+   * A second declaration for the same event throws.
    */
-  subscribe<Args extends unknown[] = unknown[]>(
-    topic: string,
-    options: SubscribeOptions,
-    handler: Handler<Args>
-  ): this {
-    const subscription = { ...options, topic };
-    const key = [topic, options.queue, options.jobtype].join('\0');
+  on<Args extends unknown[] = unknown[]>(event: string, handler: Handler<Args>, ...options: Options[]): this {
+    if (this.handlers.has(event)) {
+      const name = JSON.stringify(event);
 
-    this.subscriptions.set(key, subscription);
-    this.register(options.jobtype, handler);
+      throw new Error(`the worker has a handler for the event ${name}: use one handler for each event`);
+    }
 
-    if (!this.options.queues.includes(options.queue)) {
-      this.options.queues = [...this.options.queues, options.queue];
+    const { fields, topics } = translateOptions(...options);
+    const queue = fields.queue ?? 'default';
+
+    this.handlers.set(event, handler as Handler);
+
+    for (const topic of topics) {
+      this.subscriptions.push({ topic, queue, event, retry: fields.retry, reserveFor: fields.reserve_for });
+    }
+
+    const fetches = topics.length > 0 || fields.queue !== undefined;
+
+    if (fetches && !this.options.queues.includes(queue)) {
+      this.options.queues = [...this.options.queues, queue];
     }
 
     return this;
@@ -134,7 +138,7 @@ export class Worker {
    * jobs that still run. A late result from these handlers is ignored.
    */
   async run(options: RunOptions = {}): Promise<void> {
-    const run = new WorkerRun(this.options, this.handlers, this.middleware, [...this.subscriptions.values()]);
+    const run = new WorkerRun(this.options, this.handlers, this.middleware, [...this.subscriptions]);
 
     await run.start(options);
   }

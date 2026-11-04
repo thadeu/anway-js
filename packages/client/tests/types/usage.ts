@@ -7,24 +7,51 @@ const client: Client = new Anway.Client();
 const worker: Anway.Worker = new Named.Worker({ queues: ['default'] });
 const options: Anway.WorkerOptions = { concurrency: 2 };
 
-worker.register<[string]>('email.send', async (received, { signal }) => {
+const declaration: Anway.Options = { queue: 'realtime', retry: 3, topics: ['chat.message'] };
+const late: Named.Options = { reserveFor: 60, topics: ['chat.edit'], custom: { team: 'chat' } };
+
+worker.on<[string]>('email.send', async (received, { signal }) => {
   const value: string = received.args[0];
+  const event: string = received.type;
 
   signal.throwIfAborted();
 
-  return value;
+  return [value, event];
 });
 
-worker.subscribe<[string]>('chat.message', { queue: 'realtime', jobtype: 'chat.broadcast' }, received => {
-  const body: string = received.args[0];
+worker.on<[string]>(
+  'chat.broadcast',
+  received => {
+    const body: string = received.args[0];
 
-  return body;
+    return body;
+  },
+  declaration,
+  late
+);
+
+const pushed = new Anway.Job('mail.send', ['a@b.com'], {
+  queue: 'mail',
+  at: new Date(),
+  uniqueFor: 600,
+  uniqueUntil: 'success',
+  expiresIn: 60,
+  expiresAt: new Date(),
+  track: true,
+  onDead: { event: 'mail.bounced', queue: 'rails' },
+  custom: { source: 'usage' },
 });
+
+// @ts-expect-error uniqueUntil is success or start.
+new Anway.Job('x', [], { uniqueUntil: 'end' });
+
+// @ts-expect-error The old register method does not exist.
+worker.register('x', () => {});
 
 const subscription: Anway.Subscription = {
   topic: 'chat.message',
   queue: 'push',
-  jobtype: 'chat.notify',
+  event: 'chat.notify',
   reserveFor: 60,
 };
 const publishOptions: Anway.PublishOptions = { id: 'msg-42', uniqueFor: 0, custom: { room: 'general' } };
@@ -42,4 +69,4 @@ async function publish(): Promise<number> {
 // @ts-expect-error The args do not match the type.
 new Anway.Job<[string]>('x', [1]);
 
-export { address, client, options, publish };
+export { address, client, options, publish, pushed };

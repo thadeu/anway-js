@@ -75,7 +75,7 @@ import Anway from '@anway/client';
 
 const worker = new Anway.Worker({ queues: ['default'] });
 
-worker.register('x', () => {});
+worker.on('x', () => {});
 
 await worker.run();
 

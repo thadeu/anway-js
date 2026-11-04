@@ -7,6 +7,29 @@ const client: Client = new Anway.Client();
 const worker: Anway.Worker = new Named.Worker({ queues: ['default'] });
 const options: Anway.WorkerOptions = { concurrency: 2 };
 
+const autoscale: Anway.Autoscale = { min: 2, max: 20 };
+
+const scaled = new Anway.Worker({
+  concurrency: 4,
+  hostname: 'worker.1',
+  tag: 'shop',
+  autoscale,
+  maxConcurrency: 20,
+});
+
+// @ts-expect-error autoscale needs max.
+new Anway.Worker({ autoscale: { min: 2 } });
+
+async function bulk(): Promise<Record<string, string>> {
+  const failures: Record<string, string> = await client.pushBulk([new Anway.Job('x'), new Anway.Job('y')]);
+  const heartbeat: Anway.Heartbeat = await client.heartbeat(undefined, { concurrency: 4 });
+  const count: number | null = heartbeat.concurrency;
+
+  client.growPool(count ?? 4);
+
+  return failures;
+}
+
 const declaration: Anway.Options = { queue: 'realtime', retry: 3, topics: ['chat.message'] };
 const late: Named.Options = { reserveFor: 60, topics: ['chat.edit'], custom: { team: 'chat' } };
 
@@ -69,4 +92,4 @@ async function publish(): Promise<number> {
 // @ts-expect-error The args do not match the type.
 new Anway.Job<[string]>('x', [1]);
 
-export { address, client, options, publish, pushed };
+export { address, bulk, client, options, publish, pushed, scaled };

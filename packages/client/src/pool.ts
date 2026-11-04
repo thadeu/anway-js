@@ -13,11 +13,25 @@ export class Pool {
   private isClosed = false;
 
   constructor(
-    size: number,
+    private size: number,
     private readonly open: () => Promise<Connection>,
     private readonly timeout: number
   ) {
     this.slots = new Array<Connection | null>(size).fill(null);
+  }
+
+  /** Lets the pool hold size connections at once. A smaller size does nothing. */
+  grow(size: number): void {
+    if (this.isClosed || size <= this.size) return;
+
+    for (let added = this.size; added < size; added++) {
+      const waiter = this.waiters.shift();
+
+      if (waiter) waiter.resolve(null);
+      else this.slots.push(null);
+    }
+
+    this.size = size;
   }
 
   async use<Result>(work: (connection: Connection) => Promise<Result>): Promise<Result> {

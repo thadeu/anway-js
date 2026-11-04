@@ -1,11 +1,22 @@
+import { hostname } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Job, Worker, type Options, type WorkerOptions } from '../src/index';
 import { translateOptions } from '../src/options';
-import { ScriptedServer } from './support/scripted';
-import { cleanup, openClient, processed, record, retries, startServer, waitFor } from './support/server';
+import { ScriptedServer, type BeatReply } from './support/scripted';
+import {
+  cleanup,
+  openClient,
+  processed,
+  record,
+  retries,
+  startServer,
+  startWebServer,
+  waitFor,
+  type Recorder,
+} from './support/server';
 
 afterEach(cleanup);
 
@@ -37,6 +48,37 @@ async function within(promise: Promise<void>, limit = 8_000): Promise<void> {
       throw new Error('the worker did not stop');
     }),
   ]);
+}
+
+/** A handler that waits for release, and counts the jobs that it runs at once. After open, jobs do not wait. */
+function gate() {
+  const waiting: (() => void)[] = [];
+  let opened = false;
+
+  const state = {
+    running: 0,
+    peak: 0,
+    handler: async () => {
+      state.running++;
+      state.peak = Math.max(state.peak, state.running);
+
+      if (!opened) await new Promise<void>(resolve => waiting.push(resolve));
+
+      state.running--;
+    },
+    release: () => waiting.splice(0).forEach(resolve => resolve()),
+    open: () => {
+      opened = true;
+      state.release();
+    },
+  };
+
+  return state;
+}
+
+/** The concurrency of each BEAT that the recorder saw. */
+function beatCounts(recorder: Recorder): (number | undefined)[] {
+  return recorder.bodies<{ concurrency?: number }>('BEAT').map(body => body.concurrency);
 }
 
 describe('worker conformance', () => {
@@ -249,6 +291,279 @@ describe('worker conformance', () => {
 
     expect(await retries(client)).toBe(1);
     expect(await processed(client)).toBe(0);
+  });
+
+  it('W11 keeps running across a server restart', async () => {
+    const server = await startServer();
+    const client = openClient(server.url);
+    const { done } = start(worker(server.url, { beatInterval: 50 }).on('x', () => {}));
+    let stopped = false;
+
+    done.then(() => (stopped = true));
+
+    await client.push(new Job('x'));
+    await waitFor(async () => (await processed(client)) === 1);
+
+    await server.restart();
+
+    await client.push(new Job('x'));
+    await waitFor(async () => (await processed(client)) === 2, 10_000);
+
+    expect(stopped).toBe(false);
+  });
+
+  it('W12 starts and stops slots when a beat asks, and a stopping slot finishes its job', async () => {
+    const { server, api } = await startWebServer();
+    const client = openClient(server.url);
+    const hold = gate();
+    const slow = gate();
+    const tag = 'w12-scale';
+
+    const subject = worker(server.url, { beatInterval: 50, tag }).on('hold', hold.handler).on('slow', slow.handler);
+
+    start(subject);
+
+    await waitFor(async () => (await api.worker(tag))?.scalable === true);
+
+    const wid = (await api.worker(tag))?.wid as string;
+
+    await api.scale(wid, 3);
+    await waitFor(async () => {
+      const view = await api.worker(tag);
+
+      return view?.concurrency === 3 && view.wanted === null;
+    });
+
+    for (let i = 0; i < 3; i++) await client.push(new Job('hold'));
+
+    await waitFor(() => hold.running === 3);
+
+    hold.release();
+
+    await waitFor(async () => (await processed(client)) === 3);
+
+    await client.push(new Job('slow'));
+    await waitFor(() => slow.running === 1);
+
+    await api.scale(wid, 1);
+    await waitFor(async () => {
+      const view = await api.worker(tag);
+
+      return view?.concurrency === 1 && view.wanted === null;
+    });
+
+    // The idle slots end their FETCH, which waits up to 2 seconds, and stop.
+    await sleep(2_500);
+
+    await client.push(new Job('hold'));
+    await client.push(new Job('hold'));
+    await sleep(300);
+
+    expect(hold.running).toBe(0);
+
+    slow.release();
+
+    await waitFor(async () => (await processed(client)) === 4);
+    await waitFor(() => hold.running === 1);
+    await sleep(300);
+
+    expect(hold.running).toBe(1);
+
+    hold.open();
+
+    await waitFor(async () => (await processed(client)) === 6);
+
+    expect(await retries(client)).toBe(0);
+  });
+
+  it('W12 reports a new count at once, not at the next beat', async () => {
+    const { server, api } = await startWebServer();
+    const recorder = await record(server);
+    const tag = 'w12-report';
+
+    start(worker(recorder.url, { beatInterval: 2_000, tag }).on('x', () => {}));
+
+    await waitFor(async () => (await api.worker(tag))?.scalable === true);
+
+    await api.scale((await api.worker(tag))?.wid as string, 3);
+
+    await waitFor(async () => {
+      const view = await api.worker(tag);
+
+      return view?.concurrency === 3 && view.wanted === null;
+    }, 3_500);
+
+    const beats = recorder.commands.filter(command => command.verb === 'BEAT');
+    const reported = beatCounts(recorder).indexOf(3);
+    const gap = (beats[reported]?.at ?? 0) - (beats[reported - 1]?.at ?? 0);
+
+    expect(reported).toBeGreaterThan(0);
+    expect(gap).toBeLessThan(500);
+  });
+});
+
+describe('worker scaling', () => {
+  it('sends its identity in HELLO, and its slots in the first BEAT', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+
+    const subject = worker(recorder.url, {
+      concurrency: 2,
+      queues: ['critical', 'default'],
+      hostname: 'worker.1',
+      tag: 'shop',
+      autoscale: { min: 2, max: 6 },
+      maxConcurrency: 8,
+    });
+
+    start(subject.on('x', () => {}));
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    expect(recorder.bodies('HELLO')[0]).toMatchObject({
+      hostname: 'worker.1',
+      pid: process.pid,
+      labels: ['js'],
+      concurrency: 2,
+      queues: ['critical', 'default'],
+      tag: 'shop',
+      autoscale: { min: 2, max: 6 },
+      max_concurrency: 8,
+    });
+
+    expect(recorder.verbs.indexOf('BEAT')).toBeLessThan(recorder.verbs.indexOf('FETCH'));
+    expect(beatCounts(recorder)[0]).toBe(2);
+
+    const plain = await record(server);
+
+    start(worker(plain.url).on('x', () => {}));
+
+    await waitFor(() => plain.verbs.includes('FETCH'));
+
+    const hello = plain.bodies('HELLO')[0] ?? {};
+
+    expect(Object.keys(hello).sort()).toEqual(['concurrency', 'hostname', 'labels', 'pid', 'queues', 'v', 'wid']);
+    expect(hello.hostname).toBe(hostname());
+  });
+
+  it('rejects a concurrency above maxConcurrency', () => {
+    expect(() => worker('tcp://127.0.0.1:1', { concurrency: 4, maxConcurrency: 3 })).toThrow(RangeError);
+    expect(() => worker('tcp://127.0.0.1:1', { concurrency: 3, maxConcurrency: 3 })).not.toThrow();
+  });
+
+  it('never runs more slots than maxConcurrency', async () => {
+    const script = new ScriptedServer(beat => (beat === 2 ? { concurrency: 50 } : undefined));
+    const url = await script.listen();
+    const hold = gate();
+
+    for (let i = 0; i < 5; i++) script.jobs.push(new Job('hold').toJSON());
+
+    const { stop, done } = start(worker(url, { beatInterval: 50, maxConcurrency: 3 }).on('hold', hold.handler));
+
+    try {
+      await waitFor(() => hold.running === 3);
+      await sleep(200);
+
+      expect(hold.peak).toBe(3);
+      expect(script.beatBodies.map(body => body.concurrency)).toContain(3);
+      expect(Math.max(...script.beatBodies.map(body => body.concurrency ?? 0))).toBe(3);
+    } finally {
+      hold.open();
+      stop();
+
+      await within(done);
+
+      script.close();
+    }
+  });
+
+  it('cancels a pending stop when a beat asks for more slots', async () => {
+    let next: BeatReply | undefined;
+
+    const script = new ScriptedServer(() => {
+      const reply = next;
+
+      next = undefined;
+
+      return reply;
+    });
+
+    const url = await script.listen();
+    const hold = gate();
+    const counts = () => script.beatBodies.map(body => body.concurrency);
+
+    for (let i = 0; i < 6; i++) script.jobs.push(new Job('hold').toJSON());
+
+    const { stop, done } = start(worker(url, { concurrency: 3, beatInterval: 50 }).on('hold', hold.handler));
+
+    try {
+      await waitFor(() => hold.running === 3);
+
+      next = { concurrency: 1 };
+
+      await waitFor(() => counts().includes(1));
+
+      next = { concurrency: 3 };
+
+      await waitFor(() => counts().lastIndexOf(3) > counts().indexOf(1));
+      await sleep(200);
+
+      expect(hold.running).toBe(3);
+      expect(hold.peak).toBe(3);
+
+      hold.release();
+
+      await waitFor(() => script.acks.length === 3);
+      await waitFor(() => hold.running === 3);
+    } finally {
+      hold.open();
+      stop();
+
+      await within(done);
+
+      script.close();
+    }
+  });
+
+  it('grows the connection pool for new slots', async () => {
+    const script = new ScriptedServer(beat => (beat === 2 ? { concurrency: 4 } : undefined));
+    const url = await script.listen();
+
+    script.fetchWait = 300;
+
+    const { stop, done } = start(worker(url, { beatInterval: 50 }).on('x', () => {}));
+
+    try {
+      await waitFor(() => script.peakFetches === 4, 3_000);
+    } finally {
+      stop();
+
+      await within(done);
+
+      script.close();
+    }
+  });
+
+  it('obeys the state and the count of one beat reply', async () => {
+    const script = new ScriptedServer(beat => {
+      if (beat === 2) return { state: 'quiet', concurrency: 2 };
+
+      return beat > 6 ? 'terminate' : undefined;
+    });
+
+    const url = await script.listen();
+    const { done } = start(worker(url, { beatInterval: 50 }));
+
+    try {
+      await within(done);
+
+      const bodies = script.beatBodies;
+
+      expect(bodies[2]?.concurrency).toBe(2);
+      expect(bodies.at(-1)).toMatchObject({ current_state: 'quiet', concurrency: 2 });
+    } finally {
+      script.close();
+    }
   });
 });
 

@@ -37,6 +37,20 @@ new Anway.Job('mail.send', ['a@b.com'], { track: true, onDead: { event: 'mail.bo
 
 One client works for many concurrent callers.
 
+### Bulk push
+
+`pushBulk` sends up to 1,000 jobs with one `PUSHB` command. The server puts them in with one write.
+
+```ts
+const failures = await client.pushBulk(users.map(user => new Anway.Job('email.send', [user.email])));
+
+for (const [jid, reason] of Object.entries(failures)) console.warn(jid, reason);
+```
+
+- The reply has the reason for each job that is not in, by jid. It is `{}` when all jobs are in.
+- A refused job, such as a duplicate jid or a unique lock, does not stop the other jobs.
+- More than 1,000 jobs reject with a `RangeError`, and the client sends nothing. Send a longer list in parts.
+
 ## Worker
 
 ```ts
@@ -73,9 +87,55 @@ Run the file as a normal process: `node worker.js` or `bun worker.ts`.
 
 A thrown error or a rejected promise fails the job, and the server retries it. Delivery is at least once, so handlers must be idempotent.
 
-### Concurrency
+### Worker options
 
-`concurrency` is the number of jobs in progress, as promises. It is not threads. Use it for I/O work. Synchronous CPU work blocks the event loop, and this also stops the heartbeat. Move heavy CPU work to `worker_threads`, or run more processes.
+| Option | Default | Note |
+|---|---|---|
+| `url` | `ANWAY_URL` | |
+| `queues` | `['default']` | The worker fetches them in order. |
+| `concurrency` | `10` | The number of job slots. See [concurrency and autoscale](#concurrency-and-autoscale). |
+| `hostname` | `os.hostname()` | The name of the worker in the web UI, with `tag`. |
+| `tag` | None | A short name for the app or the role of the process, such as `shop`. |
+| `autoscale` | Off | `{ max }` or `{ min, max }`. Starts the worker with autoscale on. |
+| `maxConcurrency` | None | The most slots that the worker can run, such as the size of its database pool. |
+| `shutdownTimeout` | `25000` | Milliseconds for running jobs to finish at a stop. |
+| `cancelGrace` | `5000` | Milliseconds for canceled jobs to return. |
+| `beatInterval` | `15000` | Milliseconds between heartbeats. |
+| `labels` | `[]` | The worker also sends the label `js`. |
+| `timeout` | `10000` | Milliseconds for each server call. |
+| `tls` | None | `node:tls` options for `tcp+tls://`. |
+| `logger` | `console` | An object with `warn`. |
+
+### Concurrency and autoscale
+
+Node and Bun run JavaScript on one thread. A worker does not start threads. It starts **job slots**. A slot is one loop in the event loop: it fetches a job, runs it, and then fetches the next job. `concurrency` is the number of slots, so it is the number of jobs in progress at the same time.
+
+More slots help jobs that wait on I/O, such as HTTP calls or the database. More slots do not help jobs that use the CPU. Synchronous CPU work blocks the event loop, and this also stops the heartbeat. Move heavy CPU work to `worker_threads`, or run more processes.
+
+The web UI shows the slots as threads. The server can change the number of slots while the worker runs: from the web UI, from the HTTP API, or with autoscale.
+
+```ts
+const worker = new Anway.Worker({
+  concurrency: 5,
+  hostname: 'worker.1',
+  tag: 'shop',
+  autoscale: { min: 5, max: 40 },
+  maxConcurrency: 40,
+});
+```
+
+- The worker sends its slots, queues, `tag`, `autoscale`, and `maxConcurrency` in `HELLO`. It sends its slots in each `BEAT`, also in the first `BEAT` at start. Thus the web UI can scale the worker at once.
+- When the server asks for more slots, the worker starts them at once. When it asks for fewer slots, a slot stops after its job. The worker never stops a running job to scale down.
+- When the server asks for more slots while a stop is pending, the worker cancels the stop first. Thus the slots never go above the count.
+- The worker never runs more slots than `maxConcurrency`. A `concurrency` above `maxConcurrency` throws a `RangeError`.
+- The connection pool grows with the slots.
+- After a change, the worker sends a `BEAT` with the new count at once. It does not wait for the next interval.
+- After `quiet`, the worker does not change its slots.
+- `autoscale` without `min` uses `concurrency` as the min. The server lowers a `max` above `maxConcurrency` to it.
+- Each slot can hold a database connection. Set `maxConcurrency` to the size of your database pool, or set the autoscale `max` at or below it. If not, jobs can fail with a pool timeout.
+- The server saves a change from the web UI or the API for the worker name: `hostname` and `tag`. A container with a random hostname gets a new name at each deploy. Set a stable `hostname`, such as `worker.1`, to keep the setting across deploys.
+
+See [worker threads](https://github.com/thadeu/anway/blob/main/docs/dev/worker-threads.md) for the autoscale rule.
 
 ### Shutdown
 
@@ -175,7 +235,7 @@ worker.on('chat.broadcast', broadcast, realtime, { topics: ['chat.message'] });
 
 | Group | Operations |
 |---|---|
-| Jobs | `push`, `fetch`, `ack`, `fail`, `beat` |
+| Jobs | `push`, `pushBulk`, `fetch`, `ack`, `fail`, `beat`, `heartbeat` |
 | Topics | `publish`, `subscribe`, `unsubscribe` |
 | Queues | `pauseQueues`, `resumeQueues`, `removeQueues`, `queueSizes`, `info` |
 | Admin | `mutate` |
@@ -183,6 +243,8 @@ worker.on('chat.broadcast', broadcast, realtime, { topics: ['chat.message'] });
 | Tracking | `trackGet`, `trackSet` |
 
 `mutate(command, target, { event, jids, regexp })` selects jobs by event, jid, or a regular expression.
+
+`heartbeat(currentState, { concurrency })` sends `BEAT` with the slot count of a worker. It returns `{ state, concurrency }`, and a field is `null` when the reply does not have it. `beat(currentState)` returns only the state. `growPool(size)` lets the client hold `size` connections at once.
 
 The error kinds are `NotUniqueError`, `ClosedError`, `ServerError`, and `ConnectionError`. All extend `AnwayError`. A failed call does not resend.
 

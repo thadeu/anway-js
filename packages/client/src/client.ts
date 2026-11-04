@@ -1,12 +1,13 @@
 import type { ConnectionOptions as TlsOptions } from 'node:tls';
 
-import { Connection, type Endpoint } from './connection';
+import { Connection, type Endpoint, type WorkerIdentity } from './connection';
 import { Job, validateJson, type JobPayload, type JsonValue } from './job';
 import { Pool } from './pool';
 
 const DEFAULT_URL = 'tcp://127.0.0.1:7419';
 const DEFAULT_PORT = 7419;
 const FETCH_WAIT = 2_000;
+const MAX_BULK = 1_000;
 
 export interface ClientOptions {
   /** A blank URL uses ANWAY_URL, then the local default. */
@@ -18,6 +19,16 @@ export interface ClientOptions {
   /** Identifies a worker. It is required for fetch and beat. */
   wid?: string;
   labels?: string[];
+  /** More HELLO fields of a worker. Used only with wid. */
+  identity?: WorkerIdentity;
+}
+
+/** The reply to a BEAT. A field is null when the reply does not have it. */
+export interface Heartbeat {
+  /** "quiet" or "terminate". */
+  state: string | null;
+  /** The number of jobs that the server wants the worker to run at once. */
+  concurrency: number | null;
 }
 
 /** Selects jobs for mutate. Blank fields match all jobs. */
@@ -135,7 +146,14 @@ export class Client {
 
     this.pool = new Pool(
       options.poolSize ?? 8,
-      () => Connection.open(endpoint, { timeout, tls: options.tls, wid: options.wid, labels: options.labels }),
+      () =>
+        Connection.open(endpoint, {
+          timeout,
+          tls: options.tls,
+          wid: options.wid,
+          labels: options.labels,
+          identity: options.identity,
+        }),
       timeout
     );
   }
@@ -149,6 +167,22 @@ export class Client {
     await this.call('PUSH', job);
 
     return job.jid;
+  }
+
+  /**
+   * Pushes up to 1,000 jobs with one write. Returns the reason for each job
+   * that is not in, by jid, or {} when all are in. A refused job, such as a
+   * duplicate jid or a unique lock, does not stop the others. More than 1,000
+   * jobs reject with a RangeError, and nothing goes to the server.
+   */
+  async pushBulk(jobs: Job[]): Promise<Record<string, string>> {
+    if (jobs.length > MAX_BULK) {
+      throw new RangeError(`a bulk push has at most ${MAX_BULK} jobs, not ${jobs.length}`);
+    }
+
+    if (jobs.length === 0) return {};
+
+    return JSON.parse((await this.call('PUSHB', jobs)) ?? '{}');
   }
 
   /** Returns the next job, or null when no job arrives in about 2 seconds. */
@@ -168,11 +202,27 @@ export class Client {
 
   /** Returns null, "quiet", or "terminate". */
   async beat(currentState?: string): Promise<string | null> {
-    const reply = await this.call('BEAT', { wid: this.wid, current_state: currentState });
+    return (await this.heartbeat(currentState)).state;
+  }
 
-    if (reply === 'OK' || reply === null) return null;
+  /**
+   * Sends BEAT. A worker that sends its concurrency can get another count
+   * in the reply. The reply can have a state, a count, or both.
+   */
+  async heartbeat(currentState?: string, options: { concurrency?: number } = {}): Promise<Heartbeat> {
+    const body = { wid: this.wid, current_state: currentState, concurrency: options.concurrency };
+    const reply = await this.call('BEAT', body);
 
-    return (JSON.parse(reply) as { state: string }).state;
+    if (reply === 'OK' || reply === null) return { state: null, concurrency: null };
+
+    const data = JSON.parse(reply) as { state?: string; concurrency?: number };
+
+    return { state: data.state ?? null, concurrency: data.concurrency ?? null };
+  }
+
+  /** Lets the client hold size connections at once, for a worker that adds job slots. */
+  growPool(size: number): void {
+    this.pool.grow(size);
   }
 
   async info(): Promise<Info> {

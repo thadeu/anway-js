@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import { Client, type ClientOptions } from '../../src/index';
 
-function freePort(): Promise<number> {
+export function freePort(): Promise<number> {
   return new Promise(resolve => {
     const server = createServer();
 
@@ -99,6 +99,8 @@ export interface Command {
   verb: string;
   /** The text after the verb, such as the JSON of a job. */
   body: string;
+  /** Date.now() when the recorder got the command. */
+  at: number;
 }
 
 // A TCP proxy to a server. It records each command that a client sends.
@@ -165,7 +167,7 @@ export class Recorder {
         const verb = space === -1 ? text : text.slice(0, space);
 
         this.verbs.push(verb);
-        this.commands.push({ verb, body: space === -1 ? '' : text.slice(space + 1) });
+        this.commands.push({ verb, body: space === -1 ? '' : text.slice(space + 1), at: Date.now() });
       }
 
       upstream.write(chunk);
@@ -216,6 +218,57 @@ export async function waitFor(check: () => boolean | Promise<boolean>, limit = 5
 
     await sleep(10);
   }
+}
+
+/** A worker as the HTTP API shows it. */
+export interface WorkerView {
+  wid: string;
+  hostname: string;
+  tag: string;
+  concurrency: number;
+  wanted: number | null;
+  scalable: boolean;
+  busy: number;
+}
+
+/** The HTTP API of a test server. */
+export class WebApi {
+  constructor(
+    private readonly addr: string,
+    private readonly token: string
+  ) {}
+
+  /** The worker with this tag, or undefined. */
+  async worker(tag: string): Promise<WorkerView | undefined> {
+    const reply = await this.request('GET', '/api/v1/workers');
+    const { workers } = (await reply.json()) as { workers: WorkerView[] };
+
+    return workers.find(worker => worker.tag === tag);
+  }
+
+  async scale(wid: string, concurrency: number): Promise<void> {
+    const reply = await this.request('PATCH', `/api/v1/workers/${wid}`, { concurrency });
+
+    if (!reply.ok) throw new Error(`scale failed: ${reply.status} ${await reply.text()}`);
+  }
+
+  private request(method: string, path: string, body?: unknown): Promise<Response> {
+    return fetch(`http://${this.addr}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${this.token}` },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  }
+}
+
+/** Starts a server with the HTTP API on, and waits for the API port. */
+export async function startWebServer(): Promise<{ server: TestServer; api: WebApi }> {
+  const port = await freePort();
+  const server = await startServer({ WEB_ADDR: `127.0.0.1:${port}`, WEB_TOKEN: 't' });
+
+  await waitFor(() => portOpen(port));
+
+  return { server, api: new WebApi(`127.0.0.1:${port}`, 't') };
 }
 
 export async function retries(client: Client): Promise<number> {

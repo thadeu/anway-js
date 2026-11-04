@@ -5,6 +5,7 @@ export type {
   BatchStatus,
   ClientOptions,
   Filter,
+  Heartbeat,
   Info,
   MutateCommand,
   MutateTarget,
@@ -14,6 +15,8 @@ export type {
   Track,
   TrackUpdate,
 } from './client';
+
+export type { Autoscale, WorkerIdentity } from './connection';
 
 export { AnwayError, ClosedError, ConnectionError, NotUniqueError, ServerError, UnknownJobError } from './errors';
 

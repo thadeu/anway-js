@@ -3,8 +3,20 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { JobPayload } from '../../src/index';
 
-/** Returns the state for a BEAT reply, such as "quiet" or "terminate". Undefined replies OK. */
-export type BeatScript = (beat: number) => string | undefined;
+/** A BEAT reply with a state, a count, or both. */
+export interface BeatReply {
+  state?: string;
+  concurrency?: number;
+}
+
+/** Returns the state for a BEAT reply, such as "quiet" or "terminate", or a full reply. Undefined replies OK. */
+export type BeatScript = (beat: number) => string | BeatReply | undefined;
+
+export interface BeatPayload {
+  wid: string;
+  current_state?: string;
+  concurrency?: number;
+}
 
 export interface FailPayload {
   jid: string;
@@ -22,6 +34,12 @@ export class ScriptedServer {
   beats = 0;
   /** Fetches after the first beat. */
   quietFetches = 0;
+  /** Milliseconds that a FETCH waits when it has no job. */
+  fetchWait = 5;
+  /** FETCH commands in progress now, and the most at once. */
+  fetches = 0;
+  peakFetches = 0;
+  readonly beatBodies: BeatPayload[] = [];
   readonly jobs: JobPayload[] = [];
   readonly acks: string[] = [];
   readonly fails: FailPayload[] = [];
@@ -79,7 +97,7 @@ export class ScriptedServer {
       case 'FETCH':
         return this.fetch();
       case 'BEAT':
-        return this.beat();
+        return this.beat(argument);
       case 'ACK':
         this.acks.push((JSON.parse(argument) as { jid: string }).jid);
 
@@ -100,19 +118,25 @@ export class ScriptedServer {
 
     if (job) return bulk(JSON.stringify(job));
 
-    await sleep(5);
+    this.fetches++;
+    this.peakFetches = Math.max(this.peakFetches, this.fetches);
+
+    await sleep(this.fetchWait);
+
+    this.fetches--;
 
     return '$-1\r\n';
   }
 
-  private beat(): string {
+  private beat(argument: string): string {
     this.beats++;
+    this.beatBodies.push(JSON.parse(argument) as BeatPayload);
 
-    const state = this.script(this.beats);
+    const reply = this.script(this.beats);
 
-    if (state === undefined) return '+OK\r\n';
+    if (reply === undefined) return '+OK\r\n';
 
-    return bulk(JSON.stringify({ state }));
+    return bulk(JSON.stringify(typeof reply === 'string' ? { state: reply } : reply));
   }
 }
 

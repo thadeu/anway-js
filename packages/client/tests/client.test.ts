@@ -206,6 +206,36 @@ describe('client conformance', () => {
 
     await expect(client.push(new Job('x'))).rejects.toBeInstanceOf(ClosedError);
   });
+
+  it('C17 pushes jobs in bulk and returns the reason for a refused jid', async () => {
+    const client = openClient((await startServer()).url);
+    const existing = new Job('x');
+
+    await client.push(existing);
+
+    const failures = await client.pushBulk([new Job('x', [1]), existing, new Job('x', [2])]);
+
+    expect(Object.keys(failures)).toEqual([existing.jid]);
+    expect(failures[existing.jid]).toMatch(/exists/);
+    expect((await client.queueSizes()).default).toBe(3);
+
+    expect(await client.pushBulk([new Job('x'), new Job('x')])).toEqual({});
+    expect((await client.queueSizes()).default).toBe(5);
+  });
+
+  it('rejects a bulk push of more than 1,000 jobs before it sends', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+    const client = openClient(recorder.url);
+    const jobs = Array.from({ length: 1_001 }, () => new Job('x'));
+
+    await expect(client.pushBulk(jobs)).rejects.toBeInstanceOf(RangeError);
+
+    expect(recorder.verbs).not.toContain('PUSHB');
+
+    expect(await client.pushBulk(jobs.slice(0, 1_000))).toEqual({});
+    expect((await client.queueSizes()).default).toBe(1_000);
+  });
 });
 
 describe('topic conformance', () => {

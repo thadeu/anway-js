@@ -1,6 +1,6 @@
 {
   "name": "@anway/client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Client and worker for the Anway job server, for Node and Bun",
   "type": "module",
   "main": "./dist/index.cjs",

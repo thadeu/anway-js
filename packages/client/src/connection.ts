@@ -14,11 +14,33 @@ export interface Endpoint {
   tls: boolean;
 }
 
+/** The worker starts with autoscale on. The server uses concurrency as min when min is not set. */
+export interface Autoscale {
+  min?: number;
+  max: number;
+}
+
+/** More HELLO fields of a worker. The web UI shows them. */
+export interface WorkerIdentity {
+  /** The default is the machine name. */
+  hostname?: string;
+  /** A short name for the app or the role of the process, such as "shop". */
+  tag?: string;
+  /** The queues that the worker fetches, in order. */
+  queues?: string[];
+  /** The jobs that the worker runs at once. */
+  concurrency?: number;
+  autoscale?: Autoscale;
+  /** The most jobs that the worker can run at once, such as the size of its database pool. */
+  maxConcurrency?: number;
+}
+
 export interface ConnectionSettings {
   timeout: number;
   tls?: TlsOptions;
   wid?: string;
   labels?: string[];
+  identity?: WorkerIdentity;
 }
 
 function passwordHash(password: string, salt: string, iterations: number): string {
@@ -115,11 +137,19 @@ export class Connection {
 
     if (greeting.s) hello.pwdhash = passwordHash(endpoint.password, greeting.s, greeting.i ?? 1);
 
+    // JSON leaves out a field that is undefined, so HELLO has only the fields that are set.
     if (settings.wid) {
+      const identity = settings.identity ?? {};
+
       hello.wid = settings.wid;
-      hello.hostname = hostname();
+      hello.hostname = identity.hostname || hostname();
       hello.pid = process.pid;
       hello.labels = settings.labels ?? [];
+      hello.concurrency = identity.concurrency;
+      hello.queues = identity.queues;
+      hello.tag = identity.tag;
+      hello.autoscale = identity.autoscale;
+      hello.max_concurrency = identity.maxConcurrency;
     }
 
     await this.command('HELLO', hello);

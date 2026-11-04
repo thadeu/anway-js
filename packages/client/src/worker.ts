@@ -1,8 +1,10 @@
 import { randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
 import type { ConnectionOptions as TlsOptions } from 'node:tls';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import { Client, type Subscription } from './client';
+import { Client, type Heartbeat, type Subscription } from './client';
+import type { Autoscale } from './connection';
 import { UnknownJobError } from './errors';
 import type { Job } from './job';
 import { translateOptions, type Options } from './options';
@@ -26,8 +28,19 @@ export interface WorkerOptions {
   /** A blank URL uses ANWAY_URL. */
   url?: string;
   queues?: string[];
-  /** Jobs that run at the same time. These are promises, not threads. */
+  /**
+   * The job slots: jobs that run at the same time. A slot is a fetch-and-run
+   * loop in the event loop, not a thread. The server can change this count.
+   */
   concurrency?: number;
+  /** The name of the worker in the web UI, with tag. The default is the machine name. */
+  hostname?: string;
+  /** A short name for the app or the role of the process, such as "shop". */
+  tag?: string;
+  /** Starts the worker with autoscale on. The default min is concurrency. */
+  autoscale?: Autoscale;
+  /** The most slots that the worker can run, such as the size of its database pool. */
+  maxConcurrency?: number;
   /** Milliseconds for running jobs to finish at a stop. */
   shutdownTimeout?: number;
   /** Milliseconds for canceled jobs to return. */
@@ -78,6 +91,7 @@ export class Worker {
   private readonly middleware: Middleware[] = [];
   private readonly subscriptions: Subscription[] = [];
 
+  /** Throws a RangeError when concurrency is above maxConcurrency. */
   constructor(options: WorkerOptions = {}) {
     this.options = {
       queues: ['default'],
@@ -88,6 +102,12 @@ export class Worker {
       logger: console,
       ...options,
     };
+
+    const { concurrency, maxConcurrency } = this.options;
+
+    if (maxConcurrency !== undefined && concurrency > maxConcurrency) {
+      throw new RangeError(`concurrency ${concurrency} is above maxConcurrency ${maxConcurrency}`);
+    }
   }
 
   /**
@@ -144,12 +164,20 @@ export class Worker {
   }
 }
 
+/**
+ * One run of a worker. A slot is one fetch-and-run loop. concurrency is the
+ * count that the worker reports. While slots wait to stop after their job,
+ * the live slots are concurrency plus retiring.
+ */
 class WorkerRun {
   private readonly client: Client;
   private readonly jobs = new AbortController();
   private readonly fetching = new AbortController();
   private readonly stopRequest = deferred();
   private readonly running = new Map<string, Job>();
+  private readonly slots = new Set<Promise<void>>();
+  private concurrency: number;
+  private retiring = 0;
   private state: string | undefined;
 
   constructor(
@@ -158,6 +186,8 @@ class WorkerRun {
     private readonly middleware: Middleware[],
     private readonly subscriptions: Subscription[]
   ) {
+    this.concurrency = options.concurrency;
+
     this.client = new Client({
       url: options.url,
       tls: options.tls,
@@ -165,14 +195,27 @@ class WorkerRun {
       wid: randomBytes(12).toString('hex'),
       labels: ['js', ...(options.labels ?? [])],
       poolSize: options.concurrency + 1,
+      identity: {
+        hostname: options.hostname || hostname(),
+        tag: options.tag,
+        queues: options.queues,
+        concurrency: options.concurrency,
+        autoscale: options.autoscale,
+        maxConcurrency: options.maxConcurrency,
+      },
     });
   }
 
+  /**
+   * The first BEAT reports the slots, so the web UI can scale the worker at
+   * once. The worker obeys its reply when the slots run, so a saved count
+   * applies at once, not at the next beat.
+   */
   async start({ signal, handleSignals = true }: RunOptions): Promise<void> {
     const stop = () => this.stopRequest.resolve();
 
     try {
-      await this.client.beat();
+      const first = await this.client.heartbeat(undefined, { concurrency: this.concurrency });
 
       for (const subscription of this.subscriptions) {
         await this.client.subscribe(subscription);
@@ -187,13 +230,14 @@ class WorkerRun {
 
       signal?.addEventListener('abort', stop, { once: true });
 
-      const loops = Array.from({ length: this.options.concurrency }, () => this.fetchLoop());
-      const finished = Promise.all(loops);
+      for (let slot = 0; slot < this.concurrency; slot++) this.startSlot();
 
       this.beatLoop();
 
+      await this.obey(first);
+
       await this.stopRequest.promise;
-      await this.shutdown(finished);
+      await this.shutdown();
     } finally {
       process.off('SIGTERM', stop);
       process.off('SIGINT', stop);
@@ -218,22 +262,82 @@ class WorkerRun {
 
   private async beat(): Promise<void> {
     try {
-      const next = await this.client.beat(this.state);
-
-      if (next === 'quiet') {
-        this.state = next;
-        this.fetching.abort();
-      }
-
-      if (next === 'terminate') this.stopRequest.resolve();
+      await this.obey(await this.client.heartbeat(this.state, { concurrency: this.concurrency }));
     } catch (error) {
       this.options.logger.warn(`beat failed: ${String(error)}`);
     }
   }
 
+  /**
+   * Reads the count and the state of a reply apart, because a reply can have
+   * both. A new count goes to the server at once, not at the next beat, so the
+   * web UI shows the slots that run, and the next autoscale step starts from
+   * them. The server does not run autoscale on this BEAT.
+   */
+  private async obey(reply: Heartbeat): Promise<void> {
+    if (reply.concurrency !== null && this.resize(reply.concurrency)) {
+      try {
+        await this.client.heartbeat(this.state, { concurrency: this.concurrency });
+      } catch (error) {
+        this.options.logger.warn(`beat failed: ${String(error)}`);
+      }
+    }
+
+    if (reply.state === 'quiet') {
+      this.state = reply.state;
+      this.fetching.abort();
+    }
+
+    if (reply.state === 'terminate') this.stopRequest.resolve();
+  }
+
+  /**
+   * Starts slots, or asks slots to stop after their job. A stop that is still
+   * pending is canceled first, so the slots never go above the count. The
+   * count never goes above maxConcurrency. Returns true when the count changed.
+   */
+  private resize(wanted: number): boolean {
+    if (!Number.isInteger(wanted) || wanted < 1 || this.fetching.signal.aborted) return false;
+
+    const size = Math.min(wanted, this.options.maxConcurrency ?? wanted);
+    const change = size - this.concurrency;
+
+    if (change === 0) return false;
+
+    if (change > 0) {
+      const kept = Math.min(this.retiring, change);
+
+      this.retiring -= kept;
+      this.client.growPool(size + 1);
+
+      for (let slot = kept; slot < change; slot++) this.startSlot();
+    } else {
+      this.retiring -= change;
+    }
+
+    this.concurrency = size;
+
+    return true;
+  }
+
+  private startSlot(): void {
+    const slot: Promise<void> = this.fetchLoop().finally(() => this.slots.delete(slot));
+
+    this.slots.add(slot);
+  }
+
+  /** A slot that must stop takes one pending stop. */
+  private retire(): boolean {
+    if (this.retiring === 0) return false;
+
+    this.retiring--;
+
+    return true;
+  }
+
   /** A fetch in progress is not canceled, because its reply can hold a job. */
   private async fetchLoop(): Promise<void> {
-    while (!this.fetching.signal.aborted) {
+    while (!this.fetching.signal.aborted && !this.retire()) {
       const started = Date.now();
 
       try {
@@ -297,8 +401,11 @@ class WorkerRun {
     }
   }
 
-  private async shutdown(finished: Promise<unknown>): Promise<void> {
+  /** No slot starts after fetching stops, so the slots of now are all of them. */
+  private async shutdown(): Promise<void> {
     this.fetching.abort();
+
+    const finished = Promise.all(this.slots);
 
     if (await this.settled(finished, this.options.shutdownTimeout)) return;
 

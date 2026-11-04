@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SERVER_VERSION: v0.3.2
+  SERVER_VERSION: v0.5.1
 
 jobs:
   release:

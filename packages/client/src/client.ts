@@ -9,6 +9,19 @@ const DEFAULT_PORT = 7419;
 const FETCH_WAIT = 2_000;
 const MAX_BULK = 1_000;
 
+/** The argument of PUBLISH, and of each event of PUBLISHB. */
+function eventBody(topic: string, args: unknown[], options: PublishOptions) {
+  validateJson(args);
+
+  return {
+    topic,
+    args,
+    id: options.id,
+    unique_for: options.uniqueFor,
+    custom: options.custom,
+  };
+}
+
 export interface ClientOptions {
   /** A blank URL uses ANWAY_URL, then the local default. */
   url?: string;
@@ -94,6 +107,17 @@ export interface PublishOptions {
   uniqueFor?: number;
   /** Goes to each copy. The server adds topic and event. */
   custom?: Record<string, JsonValue>;
+}
+
+/** One event of publishBulk: a topic, its args, and the options of publish. */
+export interface BulkEvent extends PublishOptions {
+  topic: string;
+  args?: unknown[];
+}
+
+/** One result of publishBulk. error is the reason when the server refused the event. */
+export interface PublishResult extends Published {
+  error?: string;
 }
 
 /** Sends the events of a topic to a queue, as jobs of one event. */
@@ -293,17 +317,25 @@ export class Client {
 
   /** Makes one job for each subscription of the topic. With no subscription, the event goes to the dead set. */
   async publish(topic: string, args: unknown[] = [], options: PublishOptions = {}): Promise<Published> {
-    validateJson(args);
+    return JSON.parse((await this.call('PUBLISH', eventBody(topic, args, options))) as string);
+  }
 
-    const event = {
-      topic,
-      args,
-      id: options.id,
-      unique_for: options.uniqueFor,
-      custom: options.custom,
-    };
+  /**
+   * Publishes up to 1,000 events with one write. Each event works as one
+   * publish. Returns one result for each event, in the same order. A refused
+   * event, such as a bad topic, has error, and does not stop the others. More
+   * than 1,000 events reject with a RangeError, and nothing goes to the server.
+   */
+  async publishBulk(events: BulkEvent[]): Promise<PublishResult[]> {
+    if (events.length > MAX_BULK) {
+      throw new RangeError(`a bulk publish has at most ${MAX_BULK} events, not ${events.length}`);
+    }
 
-    return JSON.parse((await this.call('PUBLISH', event)) as string);
+    if (events.length === 0) return [];
+
+    const body = events.map(({ topic, args = [], ...options }) => eventBody(topic, args, options));
+
+    return JSON.parse((await this.call('PUBLISHB', body)) as string);
   }
 
   /** Idempotent. A second call sets the new retry and reserveFor. */

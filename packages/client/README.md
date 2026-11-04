@@ -195,6 +195,24 @@ await worker.run();
 - An event with no subscription goes to the dead set as one job, and the reply has `jobs: 0`.
 - `client.subscribe({ topic, queue, event, retry, reserveFor })` is idempotent. `client.unsubscribe({ topic, queue, event })` does not fail for a missing subscription.
 
+### Bulk publish
+
+`publishBulk` sends up to 1,000 events with one `PUBLISHB` command. The server saves all copies in one write, so an import, an outbox relay, or a replay is much faster than one `publish` for each event. Use `publish` for one event, such as in a request.
+
+```ts
+const results = await client.publishBulk(
+  orders.map(order => ({ topic: 'order.paid', args: [order.id], id: `order-${order.id}` })),
+);
+
+for (const result of results) {
+  if (result.error) console.warn(`event ${result.event}: ${result.error}`);
+}
+```
+
+- Each event has `topic` and `args`, and the options of `publish`: `id`, `uniqueFor`, and `custom`.
+- The results keep the order of the events. A refused event, such as a bad topic, has `error`, and does not stop the others.
+- More than 1,000 events reject with a `RangeError`, and nothing goes to the server. A bulk can make at most 10,000 jobs over all subscriptions.
+
 See [topics](https://github.com/thadeu/anway/blob/main/docs/dev/topics.md) for the server rules.
 
 ## Options
@@ -236,7 +254,7 @@ worker.on('chat.broadcast', broadcast, realtime, { topics: ['chat.message'] });
 | Group | Operations |
 |---|---|
 | Jobs | `push`, `pushBulk`, `fetch`, `ack`, `fail`, `beat`, `heartbeat` |
-| Topics | `publish`, `subscribe`, `unsubscribe` |
+| Topics | `publish`, `publishBulk`, `subscribe`, `unsubscribe` |
 | Queues | `pauseQueues`, `resumeQueues`, `removeQueues`, `queueSizes`, `info` |
 | Admin | `mutate` |
 | Batches | `batchNew`, `batchOpen`, `batchCommit`, `batchStatus` |

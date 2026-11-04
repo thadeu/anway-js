@@ -300,6 +300,35 @@ describe('topic conformance', () => {
     expect(await client.queueSizes()).toEqual({ realtime: 3 });
   });
 
+  it('T07 publishes events in bulk, keeps their order, and marks a repeated id as a duplicate', async () => {
+    const client = openClient((await startServer()).url);
+
+    await client.subscribe({ topic: 'order.paid', queue: 'billing', event: 'invoice' });
+    await client.subscribe({ topic: 'order.paid', queue: 'mailers', event: 'receipt' });
+
+    const results = await client.publishBulk([
+      { topic: 'order.paid', args: [1], id: 'order-1' },
+      { topic: 'order.paid', args: [2] },
+      { topic: 'order.paid', args: [3], id: 'order-1' },
+    ]);
+
+    expect(results.map(result => result.jobs)).toEqual([2, 2, 0]);
+    expect(results[0]).toMatchObject({ event: 'order-1', duplicate: false });
+    expect(results[0]?.error).toBeUndefined();
+    expect(results[2]).toMatchObject({ event: 'order-1', duplicate: true });
+    expect(await client.queueSizes()).toEqual({ billing: 2, mailers: 2 });
+
+    const refused = await client.publishBulk([{ topic: 'bad topic' }, { topic: 'order.paid' }]);
+
+    expect(refused[0]?.error).toContain('invalid topic name');
+    expect(refused[1]?.jobs).toBe(2);
+
+    const tooMany = Array.from({ length: 1_001 }, () => ({ topic: 'order.paid' }));
+
+    await expect(client.publishBulk(tooMany)).rejects.toThrow(RangeError);
+    expect(await client.publishBulk([])).toEqual([]);
+  });
+
   it('T04 sends an event with no subscription to the dead set', async () => {
     const client = openClient((await startServer()).url);
     const published = await client.publish('chat.message', [{ body: 'hi' }]);

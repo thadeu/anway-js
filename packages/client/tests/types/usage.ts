@@ -89,7 +89,25 @@ async function publish(): Promise<number> {
   return published.jobs;
 }
 
+const cronEntries: Anway.CronEntry[] = [
+  { schedule: '0 0 * * *', job: { event: 'credits.refill', queue: 'billing', retry: 3, reserveFor: 60 } },
+  { schedule: '0 6 * * *', job: { type: 'report.daily', args: [7], custom: { team: 'ops' } } },
+];
+
+async function cron(): Promise<void> {
+  await client.schedule('shop', cronEntries);
+  await client.unschedule('shop');
+}
+
+const cronWorker = new Anway.Worker({ tag: 'shop' });
+const nightly: Anway.Options = { queue: 'billing', cron: '0 0 * * *' };
+
+cronWorker.on('credits.refill', () => {}, nightly, { cron: ['0 0 * * *', '0 12 * * *'] });
+
+// @ts-expect-error A cron schedule is a string.
+cronWorker.on('report', () => {}, { cron: 5 });
+
 // @ts-expect-error The args do not match the type.
 new Anway.Job<[string]>('x', [1]);
 
-export { address, bulk, client, options, publish, pushed, scaled };
+export { address, bulk, client, cron, options, publish, pushed, scaled };

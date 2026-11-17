@@ -4,8 +4,8 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import Anway, { ClosedError, ConnectionError, Job, NotUniqueError, ServerError } from '../src/index';
-import { cleanup, dead, openClient, record, retries, startServer } from './support/server';
+import Anway, { ClosedError, ConnectionError, Job, NotUniqueError, ServerError, type CronEntry } from '../src/index';
+import { cleanup, dead, openClient, record, retries, startServer, startWebServer } from './support/server';
 
 afterEach(cleanup);
 
@@ -345,6 +345,96 @@ describe('topic conformance', () => {
   });
 });
 
+describe('cron conformance', () => {
+  function entry(schedule: string, event: string): CronEntry {
+    return { schedule, job: { event, queue: 'billing', retry: 3, args: [] } };
+  }
+
+  it('S01 replaces the entries of a tag, and unschedule removes them', async () => {
+    const { server, api } = await startWebServer();
+    const client = openClient(server.url);
+
+    await client.schedule('shop', [entry('0 0 * * *', 'credits.refill'), entry('*/5 * * * *', 'report')]);
+    await client.schedule('shop', [entry('0 0 * * *', 'credits.refill')]);
+
+    expect(await api.cron('shop')).toEqual([
+      { schedule: '0 0 * * *', jobtype: 'credits.refill', queue: 'billing', source: 'client', tag: 'shop' },
+    ]);
+
+    await client.schedule('shop', []);
+
+    expect(await api.cron('shop')).toEqual([]);
+
+    await client.schedule('shop', [entry('0 0 * * *', 'credits.refill')]);
+    await client.unschedule('shop');
+    await client.unschedule('shop');
+
+    expect(await api.cron('shop')).toEqual([]);
+  });
+
+  it('S02 changes nothing for a bad schedule or an entry with no job type', async () => {
+    const { server, api } = await startWebServer();
+    const client = openClient(server.url);
+
+    await client.schedule('shop', [entry('0 0 * * *', 'credits.refill')]);
+
+    const refused: CronEntry[][] = [
+      [entry('0 0 * * *', 'report'), entry('not a schedule', 'other')],
+      [{ schedule: '0 0 * * *', job: { queue: 'billing' } }],
+    ];
+
+    for (const entries of refused) {
+      await expect(client.schedule('shop', entries)).rejects.toBeInstanceOf(ServerError);
+    }
+
+    await expect(client.schedule('', [entry('0 0 * * *', 'report')])).rejects.toBeInstanceOf(ServerError);
+
+    expect((await api.cron('shop')).map(view => view.jobtype)).toEqual(['credits.refill']);
+  });
+
+  it('sends job.event as type, and the keys of a cron entry on the wire', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+    const client = openClient(recorder.url);
+
+    await client.schedule('shop', [
+      {
+        schedule: '0 0 * * *',
+        job: { event: 'credits.refill', queue: 'billing', args: [7], retry: 3, reserveFor: 60, custom: { a: 1 } },
+      },
+      { schedule: '0 1 * * *', job: { type: 'report' } },
+    ]);
+
+    await client.unschedule('shop');
+
+    expect(recorder.bodies('SCHEDULE')).toEqual([
+      {
+        tag: 'shop',
+        entries: [
+          {
+            schedule: '0 0 * * *',
+            job: { type: 'credits.refill', queue: 'billing', args: [7], retry: 3, reserve_for: 60, custom: { a: 1 } },
+          },
+          { schedule: '0 1 * * *', job: { type: 'report' } },
+        ],
+      },
+    ]);
+
+    expect(recorder.bodies('UNSCHEDULE')).toEqual([{ tag: 'shop' }]);
+  });
+
+  it('rejects cron args that are not JSON types before it sends', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+    const client = openClient(recorder.url);
+    const entries = [{ schedule: '0 0 * * *', job: { event: 'x', args: [new Date()] } }];
+
+    await expect(client.schedule('shop', entries)).rejects.toBeInstanceOf(TypeError);
+
+    expect(recorder.verbs).not.toContain('SCHEDULE');
+  });
+});
+
 describe('input contract conformance', () => {
   it('I01 sends the contract keys of a push in custom, and the event as jobtype', async () => {
     const server = await startServer();
@@ -367,6 +457,7 @@ describe('input contract conformance', () => {
       onDead: { event: 'mail.bounced', queue: 'rails' },
       custom: { unique_for: 1, track: 0, source: 'test' },
       topics: ['ignored.by.push'],
+      cron: '0 0 * * *',
     });
 
     await client.push(job);

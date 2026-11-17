@@ -33,6 +33,11 @@ export interface Options {
   custom?: Record<string, JsonValue>;
   /** One SUBSCRIBE for each topic. For a declaration only. */
   topics?: string[];
+  /**
+   * A cron schedule in UTC, or a list of them. One entry of the SCHEDULE of
+   * the worker for each schedule. For a declaration only.
+   */
+  cron?: string | string[];
 }
 
 /** The fields of a job on the wire. */
@@ -49,9 +54,11 @@ export interface Translation {
   fields: JobFields;
   /** The topics of all sets, in order, with no duplicates. */
   topics: string[];
+  /** The cron schedules of all sets, in order, with no duplicates. */
+  cron: string[];
 }
 
-type Single = Exclude<keyof Options, 'custom' | 'topics'>;
+type Single = Exclude<keyof Options, 'custom' | 'topics' | 'cron'>;
 
 const SINGLE_KEYS: Single[] = [
   'queue',
@@ -69,13 +76,14 @@ const SINGLE_KEYS: Single[] = [
 
 /**
  * Merges option sets in order and turns them into the wire fields of a job.
- * A single value from a later set wins. The topics add up with no duplicates.
- * The custom objects merge, and a later key wins. The contract keys that go
- * to custom win over a custom key with the same name.
+ * A single value from a later set wins. The topics and the cron schedules add
+ * up with no duplicates. The custom objects merge, and a later key wins. The
+ * contract keys that go to custom win over a custom key with the same name.
  */
 export function translateOptions(...sets: Options[]): Translation {
   const merged: Partial<Record<Single, unknown>> = {};
   const topics: string[] = [];
+  const cron: string[] = [];
 
   let custom: Record<string, JsonValue> | undefined;
 
@@ -86,9 +94,8 @@ export function translateOptions(...sets: Options[]): Translation {
 
     if (set.custom) custom = { ...custom, ...set.custom };
 
-    for (const topic of set.topics ?? []) {
-      if (!topics.includes(topic)) topics.push(topic);
-    }
+    addUnique(topics, set.topics ?? []);
+    addUnique(cron, typeof set.cron === 'string' ? [set.cron] : (set.cron ?? []));
   }
 
   const options = merged as Options;
@@ -107,7 +114,13 @@ export function translateOptions(...sets: Options[]): Translation {
     custom,
   };
 
-  return { fields, topics };
+  return { fields, topics, cron };
+}
+
+function addUnique(list: string[], values: string[]): void {
+  for (const value of values) {
+    if (!list.includes(value)) list.push(value);
+  }
 }
 
 /** The contract keys that go to custom, with their wire names. */

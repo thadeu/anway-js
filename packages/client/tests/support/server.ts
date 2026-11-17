@@ -231,12 +231,31 @@ export interface WorkerView {
   busy: number;
 }
 
+/** A cron entry as the HTTP API shows it. */
+export interface CronView {
+  schedule: string;
+  jobtype: string;
+  queue: string;
+  source: string;
+  tag?: string;
+}
+
 /** The HTTP API of a test server. */
 export class WebApi {
   constructor(
     private readonly addr: string,
     private readonly token: string
   ) {}
+
+  /** The cron entries that clients sent for this tag, in the order of the server. */
+  async cron(tag: string): Promise<CronView[]> {
+    const reply = await this.request('GET', '/api/v1/schedules');
+    const { cron } = (await reply.json()) as { cron: CronView[] };
+
+    return cron
+      .filter(entry => entry.source === 'client' && entry.tag === tag)
+      .map(({ schedule, jobtype, queue, source, tag }) => ({ schedule, jobtype, queue, source, tag }));
+  }
 
   /** The worker with this tag, or undefined. */
   async worker(tag: string): Promise<WorkerView | undefined> {

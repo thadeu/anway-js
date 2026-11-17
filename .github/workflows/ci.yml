@@ -6,7 +6,7 @@ on:
   pull_request:
 
 env:
-  SERVER_VERSION: v0.5.2
+  SERVER_VERSION: v0.6.0
 
 jobs:
   test:

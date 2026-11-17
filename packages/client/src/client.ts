@@ -131,6 +131,45 @@ export interface Subscription {
   reserveFor?: number;
 }
 
+/**
+ * The job of a cron entry, with the keys of a cron entry in the config of the
+ * server. event is the job type, and type is the same key. A blank queue is
+ * "default".
+ */
+export interface CronJob {
+  event?: string;
+  type?: string;
+  queue?: string;
+  args?: unknown[];
+  retry?: number;
+  /** Seconds. */
+  reserveFor?: number;
+  custom?: Record<string, JsonValue>;
+}
+
+/** A cron schedule in UTC, such as "0 0 * * *", and the job that the server pushes at each run. */
+export interface CronEntry {
+  schedule: string;
+  job: CronJob;
+}
+
+/** The wire format of a cron entry. job.event goes out as type. */
+function cronBody({ schedule, job }: CronEntry) {
+  if (job.args !== undefined) validateJson(job.args);
+
+  return {
+    schedule,
+    job: {
+      type: job.type ?? job.event,
+      queue: job.queue,
+      args: job.args,
+      retry: job.retry,
+      reserve_for: job.reserveFor,
+      custom: job.custom,
+    },
+  };
+}
+
 // Server data. The faktory hash has this name in the public wire format.
 export interface Info {
   server?: Record<string, unknown>;
@@ -356,6 +395,21 @@ export class Client {
     const { topic, queue, event } = subscription;
 
     await this.call('UNSUBSCRIBE', { topic, queue, jobtype: event });
+  }
+
+  /**
+   * Replaces all cron entries of the tag on the server, so an entry that is
+   * not in entries goes away. No entries removes the tag. A bad schedule or
+   * an entry with no event rejects with ServerError, and nothing changes.
+   * The tag is required, and follows the queue name rule.
+   */
+  async schedule(tag: string, entries: CronEntry[]): Promise<void> {
+    await this.call('SCHEDULE', { tag, entries: entries.map(cronBody) });
+  }
+
+  /** Removes all cron entries of the tag. A missing tag is not an error. */
+  async unschedule(tag: string): Promise<void> {
+    await this.call('UNSCHEDULE', { tag });
   }
 
   private call(verb: string, argument?: unknown, wait = 0): Promise<string | null> {

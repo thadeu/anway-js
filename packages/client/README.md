@@ -82,8 +82,8 @@ Run the file as a normal process: `node worker.js` or `bun worker.ts`.
 
 - A worker has one handler for each event. A second `on` for the same event throws an `Error`. For more than one flow on one topic, use more than one event, and subscribe each event to the topic.
 - The option sets merge in order. See [options](#options).
-- When the declaration has `topics` or `queue`, the worker also fetches from that queue.
-- `on` uses only `queue`, `retry`, `reserveFor`, and `topics`. The keys for a push, such as `at`, `uniqueFor`, and `custom`, have no effect in `on`.
+- When the declaration has `topics`, `cron`, or `queue`, the worker also fetches from that queue.
+- `on` uses only `queue`, `retry`, `reserveFor`, `topics`, and `cron`. The keys for a push, such as `at`, `uniqueFor`, and `custom`, have no effect in `on`.
 
 A thrown error or a rejected promise fails the job, and the server retries it. Delivery is at least once, so handlers must be idempotent.
 
@@ -95,7 +95,7 @@ A thrown error or a rejected promise fails the job, and the server retries it. D
 | `queues` | `['default']` | The worker fetches them in order. |
 | `concurrency` | `10` | The number of job slots. See [concurrency and autoscale](#concurrency-and-autoscale). |
 | `hostname` | `os.hostname()` | The name of the worker in the web UI, with `tag`. |
-| `tag` | None | A short name for the app or the role of the process, such as `shop`. |
+| `tag` | None | A short name for the app or the role of the process, such as `shop`. It is also the tag of the [cron](#cron) entries of the worker. |
 | `autoscale` | Off | `{ max }` or `{ min, max }`. Starts the worker with autoscale on. |
 | `maxConcurrency` | None | The most slots that the worker can run, such as the size of its database pool. |
 | `shutdownTimeout` | `25000` | Milliseconds for running jobs to finish at a stop. |
@@ -215,6 +215,49 @@ for (const result of results) {
 
 See [topics](https://github.com/thadeu/anway/blob/main/docs/dev/topics.md) for the server rules.
 
+## Cron
+
+Since v0.6.0, an app declares its cron entries in its own code, as Solid Queue recurring tasks do. The server saves them for the tag of the app, and keeps them after a restart. It runs them with the cron entries of its own config. Schedules use UTC.
+
+Declare the entries in the worker, with the `cron` key of `on` and a `tag`:
+
+```ts
+const worker = new Anway.Worker({ tag: 'shop' });
+
+worker.on('credits.refill', refill, { queue: 'billing', retry: 3, cron: '0 0 * * *' });
+worker.on('report.daily', report, { cron: ['0 6 * * *', '0 18 * * *'] });
+
+await worker.run();
+```
+
+- `cron` takes a string or an array of strings. Each schedule makes one entry. Its job has the event as its type, and the `queue`, `retry`, and `reserveFor` of the declaration.
+- When `run` starts, the worker sends all its entries in one `SCHEDULE` with its `tag`, before its first fetch.
+- The server replaces all entries of the tag. So an entry that you remove from the code goes away at the next start.
+- A worker with cron entries and no `tag` does not start: `run` rejects with an `Error`. A default tag could join the entries of two apps on one server.
+- A worker with no entries sends no `SCHEDULE`. So to remove the last entry of a tag, call `client.unschedule('shop')` once.
+- All processes with one tag must declare the same entries, because the last `SCHEDULE` wins.
+- The worker also fetches from the queue of each cron job.
+- A bad schedule rejects `run` with a `ServerError`, and the entries on the server do not change.
+
+Change the entries of a tag from any app, for example from a deploy script:
+
+```ts
+const client = new Anway.Client();
+
+await client.schedule('shop', [
+  { schedule: '0 0 * * *', job: { event: 'credits.refill', queue: 'billing', retry: 3 } },
+  { schedule: '0 6 * * *', job: { event: 'report.daily', args: [7] } },
+]);
+```
+
+- `job` has the keys of a cron entry in the server config: `event`, `queue`, `args`, `retry`, `reserveFor` in seconds, and `custom`. `event` goes out as `type`, and `type` is the same key.
+- `schedule(tag, entries)` replaces all entries of the tag. No entries removes the tag.
+- A bad schedule, or an entry with no event, rejects with a `ServerError`, and nothing changes. Args must be JSON types.
+- `client.unschedule(tag)` removes all entries of the tag. A missing tag is not an error.
+- `GET /api/v1/schedules` on the server shows each entry with `source` `client` and its tag.
+
+See [cron from the app](https://github.com/thadeu/anway/blob/main/docs/dev/configuration.md#cron-from-the-app) for the server rules.
+
 ## Options
 
 `new Anway.Job` and `worker.on` take the same keys in every Anway client. This is the [input contract](https://github.com/thadeu/anway/blob/main/docs/dev/clients.md#input-contract). The client changes the keys to the fields of the protocol.
@@ -234,11 +277,12 @@ See [topics](https://github.com/thadeu/anway/blob/main/docs/dev/topics.md) for t
 | `onDead` | `custom.on_dead` | `{ event, queue }`. The `event` goes out as `jobtype`. |
 | `custom` | `custom` | The keys of the app. The keys above win over a key with the same name here. |
 | `topics` | One `SUBSCRIBE` for each topic | For `worker.on` only. A push ignores it. |
+| `cron` | One entry of a `SCHEDULE` for each schedule | A string or an array. For `worker.on` only. A push ignores it. See [cron](#cron). |
 
 `worker.on` takes more than one option set. The sets merge in order:
 
 - A single value, such as `queue` or `retry`: the last set that has it wins.
-- `topics`: the topics of all sets add up, in order, with no duplicates.
+- `topics` and `cron`: the values of all sets add up, in order, with no duplicates.
 - `custom`: the objects merge, and a later key wins.
 
 ```ts
@@ -255,6 +299,7 @@ worker.on('chat.broadcast', broadcast, realtime, { topics: ['chat.message'] });
 |---|---|
 | Jobs | `push`, `pushBulk`, `fetch`, `ack`, `fail`, `beat`, `heartbeat` |
 | Topics | `publish`, `publishBulk`, `subscribe`, `unsubscribe` |
+| Cron | `schedule`, `unschedule` |
 | Queues | `pauseQueues`, `resumeQueues`, `removeQueues`, `queueSizes`, `info` |
 | Admin | `mutate` |
 | Batches | `batchNew`, `batchOpen`, `batchCommit`, `batchStatus` |

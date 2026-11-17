@@ -3,7 +3,7 @@ import { hostname } from 'node:os';
 import type { ConnectionOptions as TlsOptions } from 'node:tls';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import { Client, type Heartbeat, type Subscription } from './client';
+import { Client, type CronEntry, type Heartbeat, type Subscription } from './client';
 import type { Autoscale } from './connection';
 import { UnknownJobError } from './errors';
 import type { Job } from './job';
@@ -35,7 +35,11 @@ export interface WorkerOptions {
   concurrency?: number;
   /** The name of the worker in the web UI, with tag. The default is the machine name. */
   hostname?: string;
-  /** A short name for the app or the role of the process, such as "shop". */
+  /**
+   * A short name for the app or the role of the process, such as "shop". It is
+   * also the tag of the cron entries of the worker, and a worker with cron
+   * entries needs it.
+   */
   tag?: string;
   /** Starts the worker with autoscale on. The default min is concurrency. */
   autoscale?: Autoscale;
@@ -90,6 +94,7 @@ export class Worker {
   private readonly handlers = new Map<string, Handler>();
   private readonly middleware: Middleware[] = [];
   private readonly subscriptions: Subscription[] = [];
+  private readonly cron: CronEntry[] = [];
 
   /** Throws a RangeError when concurrency is above maxConcurrency. */
   constructor(options: WorkerOptions = {}) {
@@ -114,10 +119,13 @@ export class Worker {
    * Declares the handler of an event. The option sets merge in order, as the
    * input contract tells. The worker records one subscription for each topic,
    * with the event, queue, retry, and reserveFor of the declaration, and run
-   * sends SUBSCRIBE before its first FETCH. When the declaration has topics or
-   * a queue, the worker also fetches from that queue. Keys for a push only,
-   * such as at, uniqueFor, and custom, have no effect here.
-   * A second declaration for the same event throws.
+   * sends SUBSCRIBE before its first FETCH. For each cron schedule, the worker
+   * records one cron entry whose job has the event, queue, retry, and
+   * reserveFor of the declaration, and run sends all entries in one SCHEDULE
+   * with the tag, before its first FETCH. When the declaration has topics,
+   * cron, or a queue, the worker also fetches from that queue. Keys for a push
+   * only, such as at, uniqueFor, and custom, have no effect here. A second
+   * declaration for the same event throws.
    */
   on<Args extends unknown[] = unknown[]>(event: string, handler: Handler<Args>, ...options: Options[]): this {
     if (this.handlers.has(event)) {
@@ -126,7 +134,7 @@ export class Worker {
       throw new Error(`the worker has a handler for the event ${name}: use one handler for each event`);
     }
 
-    const { fields, topics } = translateOptions(...options);
+    const { fields, topics, cron } = translateOptions(...options);
     const queue = fields.queue ?? 'default';
 
     this.handlers.set(event, handler as Handler);
@@ -135,7 +143,11 @@ export class Worker {
       this.subscriptions.push({ topic, queue, event, retry: fields.retry, reserveFor: fields.reserve_for });
     }
 
-    const fetches = topics.length > 0 || fields.queue !== undefined;
+    for (const schedule of cron) {
+      this.cron.push({ schedule, job: { event, queue, retry: fields.retry, reserveFor: fields.reserve_for } });
+    }
+
+    const fetches = topics.length > 0 || cron.length > 0 || fields.queue !== undefined;
 
     if (fetches && !this.options.queues.includes(queue)) {
       this.options.queues = [...this.options.queues, queue];
@@ -156,9 +168,14 @@ export class Worker {
    * alive. At a stop, running jobs get shutdownTimeout to finish. Then their
    * signals abort, and they get cancelGrace to return. The worker then fails
    * jobs that still run. A late result from these handlers is ignored.
+   * A worker with cron entries and no tag rejects before it connects.
    */
   async run(options: RunOptions = {}): Promise<void> {
-    const run = new WorkerRun(this.options, this.handlers, this.middleware, [...this.subscriptions]);
+    if (this.cron.length > 0 && !this.options.tag) {
+      throw new Error('a worker with cron entries needs the tag option, the name of the app on the server');
+    }
+
+    const run = new WorkerRun(this.options, this.handlers, this.middleware, [...this.subscriptions], [...this.cron]);
 
     await run.start(options);
   }
@@ -184,7 +201,8 @@ class WorkerRun {
     private readonly options: Worker['options'],
     private readonly handlers: Map<string, Handler>,
     private readonly middleware: Middleware[],
-    private readonly subscriptions: Subscription[]
+    private readonly subscriptions: Subscription[],
+    private readonly cron: CronEntry[]
   ) {
     this.concurrency = options.concurrency;
 
@@ -220,6 +238,8 @@ class WorkerRun {
       for (const subscription of this.subscriptions) {
         await this.client.subscribe(subscription);
       }
+
+      if (this.cron.length > 0) await this.client.schedule(this.options.tag as string, this.cron);
 
       if (handleSignals) {
         process.once('SIGTERM', stop);

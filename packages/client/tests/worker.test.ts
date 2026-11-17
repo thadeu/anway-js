@@ -15,6 +15,7 @@ import {
   startServer,
   startWebServer,
   waitFor,
+  type CronView,
   type Recorder,
 } from './support/server';
 
@@ -663,6 +664,7 @@ describe('input contract conformance', () => {
         custom: { kept: 1, added: 2, shared: 'second', unique_for: 120 },
       },
       topics: ['chat.message', 'chat.edit', 'chat.delete'],
+      cron: [],
     });
 
     const server = await startServer();
@@ -731,5 +733,87 @@ describe('input contract conformance', () => {
     for (const job of received) {
       expect(job).toMatchObject({ type: 'chat.store', queue: 'cassandra', retry: 4, reserveFor: 90 });
     }
+  });
+});
+
+describe('cron worker conformance', () => {
+  it('S03 sends one SCHEDULE with all entries and its tag before the first FETCH', async () => {
+    const { server, api } = await startWebServer();
+    const recorder = await record(server);
+
+    const subject = worker(recorder.url, { tag: 'shop' })
+      .on('credits.refill', () => {}, { queue: 'billing', retry: 3 }, { cron: '0 0 * * *' })
+      .on('report', () => {}, { cron: ['*/5 * * * *', '0 12 * * *'] });
+
+    start(subject);
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    expect(recorder.verbs.filter(verb => verb === 'SCHEDULE')).toHaveLength(1);
+    expect(recorder.verbs.indexOf('SCHEDULE')).toBeLessThan(recorder.verbs.indexOf('FETCH'));
+
+    expect(recorder.bodies('SCHEDULE')).toEqual([
+      {
+        tag: 'shop',
+        entries: [
+          { schedule: '0 0 * * *', job: { type: 'credits.refill', queue: 'billing', retry: 3 } },
+          { schedule: '*/5 * * * *', job: { type: 'report', queue: 'default' } },
+          { schedule: '0 12 * * *', job: { type: 'report', queue: 'default' } },
+        ],
+      },
+    ]);
+
+    const views: CronView[] = [
+      { schedule: '0 0 * * *', jobtype: 'credits.refill', queue: 'billing', source: 'client', tag: 'shop' },
+      { schedule: '*/5 * * * *', jobtype: 'report', queue: 'default', source: 'client', tag: 'shop' },
+      { schedule: '0 12 * * *', jobtype: 'report', queue: 'default', source: 'client', tag: 'shop' },
+    ];
+
+    expect(await api.cron('shop')).toEqual(views);
+
+    const untagged = worker('tcp://127.0.0.1:1').on('report', () => {}, { cron: '0 0 * * *' });
+
+    await expect(untagged.run({ handleSignals: false })).rejects.toThrow(/cron entries needs the tag option/);
+  });
+
+  it('merges cron like topics, and the jobs use the queue, retry, and reserveFor of the declaration', async () => {
+    const first: Options = { cron: '0 0 * * *', retry: 2, reserveFor: 90 };
+    const second: Options = { cron: ['0 0 * * *', '0 1 * * *'], queue: 'billing' };
+
+    expect(translateOptions(first, second).cron).toEqual(['0 0 * * *', '0 1 * * *']);
+
+    const server = await startServer();
+    const recorder = await record(server);
+
+    start(worker(recorder.url, { tag: 'shop' }).on('refill', () => {}, first, second));
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    const job = { type: 'refill', queue: 'billing', retry: 2, reserve_for: 90 };
+
+    expect(recorder.bodies('SCHEDULE')).toEqual([
+      {
+        tag: 'shop',
+        entries: [
+          { schedule: '0 0 * * *', job },
+          { schedule: '0 1 * * *', job },
+        ],
+      },
+    ]);
+
+    const fetched = recorder.commands.find(command => command.verb === 'FETCH')?.body;
+
+    expect(fetched?.split(' ')).toEqual(['default', 'billing']);
+  });
+
+  it('sends no SCHEDULE for a worker with no cron entries', async () => {
+    const server = await startServer();
+    const recorder = await record(server);
+
+    start(worker(recorder.url, { tag: 'shop' }).on('report', () => {}, { queue: 'reports' }));
+
+    await waitFor(() => recorder.verbs.includes('FETCH'));
+
+    expect(recorder.verbs).not.toContain('SCHEDULE');
   });
 });

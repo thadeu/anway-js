@@ -4,6 +4,8 @@ export type {
   Batch,
   BatchStatus,
   ClientOptions,
+  CronEntry,
+  CronJob,
   Filter,
   Heartbeat,
   Info,
